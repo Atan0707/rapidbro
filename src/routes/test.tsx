@@ -26,7 +26,14 @@ function RouteComponent() {
                 }
             })
             console.log(`Total vehicles: ${vehiclePositions.length}`)
-            console.log(vehiclePositions)
+            // console.log(vehiclePositions)
+            
+            const T789 = vehiclePositions.filter((vehicle) => vehicle.trip.routeId === 'T7890')
+            console.log(`Total T789 vehicles: ${T789.length}`)
+            console.log(T789)
+            T789.forEach((vehicle) => {
+                console.log(`${vehicle.position?.latitude ?? 'N/A'}, ${vehicle.position?.longitude ?? 'N/A'}`)
+            })
         } catch (error) {
             console.error('Error fetching data:', error)
         }
@@ -34,7 +41,7 @@ function RouteComponent() {
 
     useEffect(() => {
         getData()
-    }, [])
+    }, [30000])
    
     return <div>Hello "/test"!</div>
 }
