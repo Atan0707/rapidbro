@@ -16,8 +16,9 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
-// Connection timeout in milliseconds (10 seconds without data = disconnected)
-#define CONNECTION_TIMEOUT 10000
+// Connection timeout in milliseconds (15 seconds without data = disconnected)
+// Should be longer than the sender's interval (10 seconds) to avoid false disconnects
+#define CONNECTION_TIMEOUT 15000
 
 Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
