@@ -21,8 +21,8 @@
 
 Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-const char* ssid = "HOTSPORT25";
-const char* password = "ZC224141";
+const char* ssid = "";
+const char* password = "";
 
 // NTP Client setup
 WiFiUDP ntpUDP;
