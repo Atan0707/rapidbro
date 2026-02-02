@@ -36,7 +36,9 @@ async fn main() {
     // fetch_all_buses().await;
     
     // Or get specific route:
-    get_route_t789().await;
+    // get_route_t789().await;
+
+    prasarana_gtfs_data().await;
 }
 
 // Fetch all buses - connect without specifying a route to see what we get
@@ -233,5 +235,13 @@ async fn prasarana_gtfs_data() {
     let response = reqwest::get(endpoint).await.unwrap();
     let body = response.bytes().await.unwrap();
     let feed = gtfs_realtime::FeedMessage::decode(body).unwrap();
-    println!("GTFS Feed: {:?}", feed);
+
+    // Convert entire feed to JSON
+    match serde_json::to_string_pretty(&feed) {
+        Ok(json) => println!("{}", json),
+        Err(e) => {
+            eprintln!("Failed to serialize to JSON: {:?}", e);
+            println!("GTFS Feed (debug): {:?}", feed);
+        }
+    }
 }
