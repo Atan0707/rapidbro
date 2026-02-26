@@ -170,6 +170,13 @@ struct GetAllResponse {
     meta: GetAllMeta,
 }
 
+#[derive(Debug)]
+struct RedisBusSnapshot {
+    buses: Vec<BusPosition>,
+    active_bus_count: usize,
+    last_ingest_at_unix_ms: Option<i64>,
+}
+
 const SOCKET_URL: &str = "https://rapidbus-socketio-avl.prasarana.com.my";
 const GTFS_DATA_PATH: &str = "../rapid_kl_data";
 const REDIS_BUSES_LATEST_KEY: &str = "rapidbro:buses:latest";
@@ -254,6 +261,31 @@ async fn main() {
 async fn fetch_all_buses(
     State(state): State<AppState>,
 ) -> Result<Json<GetAllResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = load_active_bus_snapshot(&state).await?;
+    let now_ms = now_unix_ms();
+    let is_stale = match snapshot.last_ingest_at_unix_ms {
+        Some(last_ingest_ms) => now_ms - last_ingest_ms > state.stale_after_ms,
+        None => true,
+    };
+
+    println!(
+        "Calling fetch_all_buses via Redis: {} active buses",
+        snapshot.buses.len()
+    );
+    Ok(Json(GetAllResponse {
+        data: snapshot.buses,
+        meta: GetAllMeta {
+            source: "redis",
+            last_ingest_at_unix_ms: snapshot.last_ingest_at_unix_ms,
+            is_stale,
+            active_bus_count: snapshot.active_bus_count,
+        },
+    }))
+}
+
+async fn load_active_bus_snapshot(
+    state: &AppState,
+) -> Result<RedisBusSnapshot, (StatusCode, Json<ErrorResponse>)> {
     let now_ms = now_unix_ms();
     let cutoff_ms = now_ms - state.bus_ttl_ms;
     let mut redis_conn = state
@@ -309,7 +341,7 @@ async fn fetch_all_buses(
 
         raw_buses
             .into_iter()
-            .filter_map(|entry| entry)
+            .flatten()
             .filter_map(|entry| serde_json::from_str::<BusPosition>(&entry).ok())
             .collect()
     };
@@ -320,24 +352,11 @@ async fn fetch_all_buses(
         .await
         .unwrap_or(None);
 
-    let is_stale = match last_ingest_at_unix_ms {
-        Some(last_ingest_ms) => now_ms - last_ingest_ms > state.stale_after_ms,
-        None => true,
-    };
-
-    println!(
-        "Calling fetch_all_buses via Redis: {} active buses",
-        buses.len()
-    );
-    Ok(Json(GetAllResponse {
-        data: buses,
-        meta: GetAllMeta {
-            source: "redis",
-            last_ingest_at_unix_ms,
-            is_stale,
-            active_bus_count: active_bus_ids.len(),
-        },
-    }))
+    Ok(RedisBusSnapshot {
+        buses,
+        active_bus_count: active_bus_ids.len(),
+        last_ingest_at_unix_ms,
+    })
 }
 
 async fn get_ingestor_status(State(state): State<AppState>) -> Json<IngestorStatus> {
@@ -627,6 +646,11 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorRespo
     )
 }
 
+fn is_t789_route(route: &str) -> bool {
+    let normalized = route.trim().to_uppercase();
+    normalized == "T789" || normalized == "T7890" || normalized.starts_with("T789")
+}
+
 fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -634,159 +658,45 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// Get buses for route T789 specifically
-async fn get_route_t789() -> Json<serde_json::Value> {
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+// Get buses for route T789 specifically from Redis snapshot
+async fn get_route_t789(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = load_active_bus_snapshot(&state).await?;
+    let t789_buses: Vec<BusPosition> = snapshot
+        .buses
+        .into_iter()
+        .filter(|bus| is_t789_route(&bus.route))
+        .collect();
 
-    let result = Arc::new(Mutex::new(Vec::new()));
-    let result_clone = result.clone();
+    println!(
+        "Calling get_route_t789 via Redis: {} active buses",
+        t789_buses.len()
+    );
 
-    let on_any = move |_event: rust_socketio::Event,
-                       payload: Payload,
-                       _socket: rust_socketio::asynchronous::Client| {
-        let result = result_clone.clone();
-        async move {
-            match payload {
-                Payload::Text(values) => {
-                    for value in values {
-                        if let Some(encoded_str) = value.as_str() {
-                            if let Some(decoded) = decode_bus_data(encoded_str) {
-                                if let Ok(json) =
-                                    serde_json::from_str::<serde_json::Value>(&decoded)
-                                {
-                                    result.lock().await.push(json);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        .boxed()
-    };
-
-    let socket = ClientBuilder::new(SOCKET_URL)
-        .transport_type(TransportType::Websocket)
-        .on_any(on_any)
-        .on("connect", |_, socket| {
-            async move {
-                let payload = json!({
-                    "sid": "",
-                    "uid": "",
-                    "provider": "RKL",
-                    "route": "T789"
-                });
-                let _ = socket.emit("onFts-reload", payload).await;
-            }
-            .boxed()
-        })
-        .connect()
-        .await;
-
-    if let Ok(socket) = socket {
-        let payload = json!({
-            "sid": "",
-            "uid": "",
-            "provider": "RKL",
-            "route": "T789"
-        });
-        let _ = socket.emit("onFts-reload", payload).await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
-
-    let data = result.lock().await;
-    println!("Calling get_route_t789");
-    if data.len() == 1 {
-        Json(data[0].clone())
+    if t789_buses.len() == 1 {
+        let value = serde_json::to_value(&t789_buses[0]).unwrap_or_else(|_| json!({}));
+        Ok(Json(value))
     } else {
-        Json(json!(data.clone()))
+        let value = serde_json::to_value(&t789_buses).unwrap_or_else(|_| json!([]));
+        Ok(Json(value))
     }
 }
 
-// Calculate ETA for T789 buses to reach stop 1000838 (KL1397 FLAT PKNS KERINCHI/KL GATEWAY)
-async fn get_t789_eta() -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResponse>)> {
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
+// Calculate ETA for T789 buses from Redis snapshot to reach stop 1000838 (KL1397 FLAT PKNS KERINCHI/KL GATEWAY)
+async fn get_t789_eta(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResponse>)> {
     const TARGET_STOP_ID: &str = "1000838";
     const DEFAULT_SPEED_KMH: f64 = 20.0;
 
-    // --- Step 1: Fetch live bus positions via websocket (same as get_route_t789) ---
-    let result = Arc::new(Mutex::new(Vec::new()));
-    let result_clone = result.clone();
-
-    let on_any = move |_event: rust_socketio::Event,
-                       payload: Payload,
-                       _socket: rust_socketio::asynchronous::Client| {
-        let result = result_clone.clone();
-        async move {
-            match payload {
-                Payload::Text(values) => {
-                    for value in values {
-                        if let Some(encoded_str) = value.as_str() {
-                            if let Some(decoded) = decode_bus_data(encoded_str) {
-                                if let Ok(json) =
-                                    serde_json::from_str::<serde_json::Value>(&decoded)
-                                {
-                                    result.lock().await.push(json);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        .boxed()
-    };
-
-    let socket = ClientBuilder::new(SOCKET_URL)
-        .transport_type(TransportType::Websocket)
-        .on_any(on_any)
-        .on("connect", |_, socket| {
-            async move {
-                let payload = json!({
-                    "sid": "",
-                    "uid": "",
-                    "provider": "RKL",
-                    "route": "T789"
-                });
-                let _ = socket.emit("onFts-reload", payload).await;
-            }
-            .boxed()
-        })
-        .connect()
-        .await;
-
-    if let Ok(socket) = socket {
-        let payload = json!({
-            "sid": "",
-            "uid": "",
-            "provider": "RKL",
-            "route": "T789"
-        });
-        let _ = socket.emit("onFts-reload", payload).await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
-
-    let raw_data = result.lock().await;
-
-    // Parse bus positions from the raw JSON
-    let mut buses: Vec<BusPosition> = Vec::new();
-    for value in raw_data.iter() {
-        // The data may come as a single object or an array
-        if let Ok(bus) = serde_json::from_value::<BusPosition>(value.clone()) {
-            buses.push(bus);
-        } else if let Some(arr) = value.as_array() {
-            for item in arr {
-                if let Ok(bus) = serde_json::from_value::<BusPosition>(item.clone()) {
-                    buses.push(bus);
-                }
-            }
-        }
-    }
+    // --- Step 1: Read live bus positions from Redis snapshot ---
+    let snapshot = load_active_bus_snapshot(&state).await?;
+    let buses: Vec<BusPosition> = snapshot
+        .buses
+        .into_iter()
+        .filter(|bus| is_t789_route(&bus.route))
+        .collect();
 
     // --- Step 2: Load route stops for T7890 from GTFS data ---
     let routes = load_routes().map_err(|e| {
