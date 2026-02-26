@@ -22,6 +22,26 @@ type NearestStopResponse = {
   distance_meters: number
 }
 
+type BusPosition = {
+  bus_no: string
+  route: string
+  latitude: number
+  longitude: number
+  speed: number
+}
+
+type GetAllMeta = {
+  source: string
+  last_ingest_at_unix_ms: number | null
+  is_stale: boolean
+  active_bus_count: number
+}
+
+type GetAllResponse = {
+  data: BusPosition[]
+  meta: GetAllMeta
+}
+
 type UserCoords = {
   lat: number
   lon: number
@@ -36,8 +56,11 @@ function App() {
   const [nearestStop, setNearestStop] = useState<NearestStopResponse | null>(
     null,
   )
+  const [busSnapshot, setBusSnapshot] = useState<GetAllResponse | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [isLoadingBuses, setIsLoadingBuses] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [busErrorMessage, setBusErrorMessage] = useState<string | null>(null)
 
   const fetchNearestStop = async (lat: number, lon: number) => {
     const params = new URLSearchParams({
@@ -100,9 +123,34 @@ function App() {
     )
   }
 
+  const fetchAllBuses = async () => {
+    setBusErrorMessage(null)
+    setIsLoadingBuses(true)
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/get-all`)
+      if (!response.ok) {
+        const fallbackMessage = 'Unable to fetch live buses'
+        const body = (await response.json().catch(() => null)) as {
+          error?: string
+        } | null
+        throw new Error(body?.error ?? fallbackMessage)
+      }
+
+      const data = (await response.json()) as GetAllResponse
+      setBusSnapshot(data)
+    } catch (error) {
+      setBusErrorMessage(
+        error instanceof Error ? error.message : 'Unable to fetch live buses',
+      )
+    } finally {
+      setIsLoadingBuses(false)
+    }
+  }
+
   return (
     <main className="mx-auto max-w-4xl p-4 md:p-6">
-      <Card>
+      <Card className="mb-6">
         <CardHeader>
           <CardTitle>Nearest Bus Stop Finder</CardTitle>
           <CardDescription>
@@ -178,6 +226,88 @@ function App() {
                 Find nearest stop
               </span>{' '}
               to begin.
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Live Bus Snapshot</CardTitle>
+          <CardDescription>
+            Reads `/get-all` from backend Redis cache.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Button
+            type="button"
+            onClick={fetchAllBuses}
+            disabled={isLoadingBuses}
+          >
+            {isLoadingBuses ? (
+              <>
+                <LoaderCircle className="animate-spin" />
+                Loading buses...
+              </>
+            ) : (
+              'Refresh buses'
+            )}
+          </Button>
+
+          {busErrorMessage ? (
+            <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3">
+              <p className="inline-flex items-center gap-2 text-sm font-medium text-destructive">
+                <AlertTriangle className="h-4 w-4" />
+                Error
+              </p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {busErrorMessage}
+              </p>
+            </div>
+          ) : null}
+
+          {busSnapshot ? (
+            <div className="rounded-md border p-4">
+              <p className="text-sm font-medium">
+                Active buses: {busSnapshot.meta.active_bus_count}
+              </p>
+              <p className="text-sm text-muted-foreground">
+                Source: {busSnapshot.meta.source}
+              </p>
+              <p className="text-sm text-muted-foreground">
+                Status: {busSnapshot.meta.is_stale ? 'Stale' : 'Fresh'}
+              </p>
+              <p className="text-sm text-muted-foreground">
+                Last ingest:{' '}
+                {busSnapshot.meta.last_ingest_at_unix_ms
+                  ? new Date(
+                      busSnapshot.meta.last_ingest_at_unix_ms,
+                    ).toLocaleString()
+                  : 'N/A'}
+              </p>
+
+              <div className="mt-3 space-y-2">
+                {busSnapshot.data.slice(0, 8).map((bus) => (
+                  <div
+                    key={`${bus.bus_no}-${bus.route}`}
+                    className="rounded border bg-muted/30 p-2 text-sm"
+                  >
+                    <p className="font-medium">
+                      {bus.bus_no} · Route {bus.route}
+                    </p>
+                    <p className="text-muted-foreground">
+                      {bus.latitude.toFixed(5)}, {bus.longitude.toFixed(5)} ·{' '}
+                      {bus.speed.toFixed(1)} km/h
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+              Tap{' '}
+              <span className="font-medium text-foreground">Refresh buses</span>{' '}
+              to load Redis-backed bus data.
             </div>
           )}
         </CardContent>

@@ -19,6 +19,7 @@ use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, RwLock};
+use tokio::time::MissedTickBehavior;
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,7 +469,36 @@ async fn run_bus_ingestor(state: AppState) {
                 }
 
                 backoff_seconds = 1;
-                disconnect_notify.notified().await;
+                let mut reload_interval = tokio::time::interval(Duration::from_secs(20));
+                reload_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                // Consume immediate first tick so the first periodic reload happens after the interval.
+                reload_interval.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = disconnect_notify.notified() => {
+                            break;
+                        }
+                        _ = reload_interval.tick() => {
+                            let payload = json!({
+                                "sid": "",
+                                "uid": "",
+                                "provider": "RKL",
+                                "route": ""
+                            });
+
+                            if let Err(error) = socket.emit("onFts-reload", payload).await {
+                                record_ingestor_error(
+                                    &state,
+                                    format!("Periodic socket reload emit failed: {}", error),
+                                    true,
+                                )
+                                .await;
+                                break;
+                            }
+                        }
+                    }
+                }
                 drop(socket);
             }
             Err(error) => {
