@@ -45,10 +45,13 @@ jobs:
           TAG: ${{ github.sha }}
           BE_PUBLIC_URL: ${{ vars.BE_PUBLIC_URL }}
         run: |
+          if [ -z "${BE_PUBLIC_URL}" ]; then
+            echo "BE_PUBLIC_URL is not set. Add it in GitHub Actions Variables."
+            exit 1
+          fi
           OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
           FE_IMAGE="ghcr.io/${OWNER_LC}/rapidbro-fe"
-          PUBLIC_BE_URL="${BE_PUBLIC_URL:-http://localhost:3030}"
-          docker build -f fe/Dockerfile --build-arg VITE_BE_URL="${PUBLIC_BE_URL}" -t "${FE_IMAGE}:${TAG}" -t "${FE_IMAGE}:latest" .
+          docker build -f fe/Dockerfile --build-arg VITE_BE_URL="${BE_PUBLIC_URL}" -t "${FE_IMAGE}:${TAG}" -t "${FE_IMAGE}:latest" .
           docker push "${FE_IMAGE}:${TAG}"
           docker push "${FE_IMAGE}:latest"
 
