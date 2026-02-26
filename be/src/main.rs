@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
     Json, Router,
@@ -12,10 +12,13 @@ use rust_socketio::{asynchronous::ClientBuilder, Payload, TransportType};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path as StdPath;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Notify, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,99 +135,473 @@ struct BusEta {
     eta_minutes: f64,
 }
 
+#[derive(Debug, Clone)]
+struct AppState {
+    redis_client: redis::Client,
+    ingestor_status: Arc<RwLock<IngestorStatus>>,
+    bus_ttl_ms: i64,
+    stale_after_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IngestorStatus {
+    connected: bool,
+    reconnect_count: u64,
+    messages_processed: u64,
+    buses_written: u64,
+    decode_failures: u64,
+    redis_write_failures: u64,
+    last_message_unix_ms: Option<i64>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GetAllMeta {
+    source: &'static str,
+    last_ingest_at_unix_ms: Option<i64>,
+    is_stale: bool,
+    active_bus_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GetAllResponse {
+    data: Vec<BusPosition>,
+    meta: GetAllMeta,
+}
+
 const SOCKET_URL: &str = "https://rapidbus-socketio-avl.prasarana.com.my";
 const GTFS_DATA_PATH: &str = "../rapid_kl_data";
+const REDIS_BUSES_LATEST_KEY: &str = "rapidbro:buses:latest";
+const REDIS_BUSES_LAST_SEEN_KEY: &str = "rapidbro:buses:last_seen";
+const REDIS_INGEST_LAST_KEY: &str = "rapidbro:ingestor:last_ingest_at";
+const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379/";
+const DEFAULT_BUS_TTL_SECONDS: i64 = 120;
+const DEFAULT_STALE_AFTER_SECONDS: i64 = 20;
 
 #[tokio::main]
 async fn main() {
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.to_string());
+    let bus_ttl_seconds = env::var("BUS_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_BUS_TTL_SECONDS);
+    let stale_after_seconds = env::var("STALE_AFTER_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_STALE_AFTER_SECONDS);
 
     let cors = CorsLayer::new()
-    .allow_origin(Any)
-    .allow_methods(Any)
-    .allow_headers(Any);
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let redis_client = redis::Client::open(redis_url.clone()).unwrap_or_else(|error| {
+        panic!(
+            "Failed to create Redis client for '{}': {}",
+            redis_url, error
+        );
+    });
+
+    // Fail fast if Redis is unavailable at startup.
+    let mut redis_conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap_or_else(|error| panic!("Failed to connect to Redis '{}': {}", redis_url, error));
+    let _: String = redis::cmd("PING")
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or_else(|error| panic!("Failed to ping Redis '{}': {}", redis_url, error));
+
+    let app_state = AppState {
+        redis_client: redis_client.clone(),
+        ingestor_status: Arc::new(RwLock::new(IngestorStatus {
+            connected: false,
+            reconnect_count: 0,
+            messages_processed: 0,
+            buses_written: 0,
+            decode_failures: 0,
+            redis_write_failures: 0,
+            last_message_unix_ms: None,
+            last_error: None,
+        })),
+        bus_ttl_ms: bus_ttl_seconds * 1_000,
+        stale_after_ms: stale_after_seconds * 1_000,
+    };
+
+    let ingestor_state = app_state.clone();
+    tokio::spawn(async move {
+        run_bus_ingestor(ingestor_state).await;
+    });
 
     let app = Router::new()
-    .route("/gtfs", get(prasarana_gtfs_data))
-    .route("/get-all", get(fetch_all_buses))
-    .route("/get-route-t789", get(get_route_t789))
-    .route("/get-t789-eta", get(get_t789_eta))
-    .route("/route/{route_id}/stops", get(get_route_stops))
-    .route("/stops/nearest", get(get_nearest_stop))
-    .layer(cors);
+        .route("/gtfs", get(prasarana_gtfs_data))
+        .route("/get-all", get(fetch_all_buses))
+        .route("/ingestor/status", get(get_ingestor_status))
+        .route("/get-route-t789", get(get_route_t789))
+        .route("/get-t789-eta", get(get_t789_eta))
+        .route("/route/{route_id}/stops", get(get_route_stops))
+        .route("/stops/nearest", get(get_nearest_stop))
+        .layer(cors)
+        .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3030")
-    .await
-    .unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3030").await.unwrap();
 
     println!("Server is running on http://localhost:3030");
     axum::serve(listener, app).await.unwrap();
 }
 
-// Fetch all buses - connect without specifying a route to see what we get
-async fn fetch_all_buses() -> Json<serde_json::Value> {
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+async fn fetch_all_buses(
+    State(state): State<AppState>,
+) -> Result<Json<GetAllResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let now_ms = now_unix_ms();
+    let cutoff_ms = now_ms - state.bus_ttl_ms;
+    let mut redis_conn = state
+        .redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(internal_error)?;
 
-    let result = Arc::new(Mutex::new(Vec::new()));
-    let result_clone = result.clone();
+    let stale_bus_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+        .arg(REDIS_BUSES_LAST_SEEN_KEY)
+        .arg("-inf")
+        .arg(cutoff_ms)
+        .query_async(&mut redis_conn)
+        .await
+        .map_err(internal_error)?;
 
-    let on_any = move |_event: rust_socketio::Event, payload: Payload, _socket: rust_socketio::asynchronous::Client| {
-        let result = result_clone.clone();
-        async move {
-            match payload {
-                Payload::Text(values) => {
-                    for value in values {
-                        if let Some(encoded_str) = value.as_str() {
-                            if let Some(decoded) = decode_bus_data(encoded_str) {
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&decoded) {
-                                    result.lock().await.push(json);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        .boxed()
+    if !stale_bus_ids.is_empty() {
+        let mut delete_pipe = redis::pipe();
+        delete_pipe
+            .cmd("HDEL")
+            .arg(REDIS_BUSES_LATEST_KEY)
+            .arg(&stale_bus_ids)
+            .ignore();
+        delete_pipe
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(REDIS_BUSES_LAST_SEEN_KEY)
+            .arg("-inf")
+            .arg(cutoff_ms)
+            .ignore();
+        delete_pipe
+            .query_async::<()>(&mut redis_conn)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    let active_bus_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+        .arg(REDIS_BUSES_LAST_SEEN_KEY)
+        .arg(cutoff_ms + 1)
+        .arg("+inf")
+        .query_async(&mut redis_conn)
+        .await
+        .map_err(internal_error)?;
+
+    let buses: Vec<BusPosition> = if active_bus_ids.is_empty() {
+        Vec::new()
+    } else {
+        let raw_buses: Vec<Option<String>> = redis::cmd("HMGET")
+            .arg(REDIS_BUSES_LATEST_KEY)
+            .arg(&active_bus_ids)
+            .query_async(&mut redis_conn)
+            .await
+            .map_err(internal_error)?;
+
+        raw_buses
+            .into_iter()
+            .filter_map(|entry| entry)
+            .filter_map(|entry| serde_json::from_str::<BusPosition>(&entry).ok())
+            .collect()
     };
 
-    let socket = ClientBuilder::new(SOCKET_URL)
-        .transport_type(TransportType::Websocket)
-        .on_any(on_any)
-        .on("connect", |_, socket| {
+    let last_ingest_at_unix_ms: Option<i64> = redis::cmd("GET")
+        .arg(REDIS_INGEST_LAST_KEY)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or(None);
+
+    let is_stale = match last_ingest_at_unix_ms {
+        Some(last_ingest_ms) => now_ms - last_ingest_ms > state.stale_after_ms,
+        None => true,
+    };
+
+    println!(
+        "Calling fetch_all_buses via Redis: {} active buses",
+        buses.len()
+    );
+    Ok(Json(GetAllResponse {
+        data: buses,
+        meta: GetAllMeta {
+            source: "redis",
+            last_ingest_at_unix_ms,
+            is_stale,
+            active_bus_count: active_bus_ids.len(),
+        },
+    }))
+}
+
+async fn get_ingestor_status(State(state): State<AppState>) -> Json<IngestorStatus> {
+    Json(state.ingestor_status.read().await.clone())
+}
+
+async fn run_bus_ingestor(state: AppState) {
+    let mut backoff_seconds: u64 = 1;
+
+    loop {
+        let redis_conn = match state.redis_client.get_multiplexed_async_connection().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                record_ingestor_error(
+                    &state,
+                    format!("Redis connection failed before socket connect: {}", error),
+                    true,
+                )
+                .await;
+                tokio::time::sleep(Duration::from_secs(backoff_seconds)).await;
+                backoff_seconds = (backoff_seconds * 2).min(30);
+                continue;
+            }
+        };
+
+        let disconnect_notify = Arc::new(Notify::new());
+        let on_any_state = state.clone();
+        let on_any_conn = redis_conn.clone();
+
+        let on_any = move |_event: rust_socketio::Event,
+                           payload: Payload,
+                           _socket: rust_socketio::asynchronous::Client| {
+            let state = on_any_state.clone();
+            let mut redis_conn = on_any_conn.clone();
             async move {
+                let now_ms = now_unix_ms();
+                let (buses, decode_failures) = parse_bus_positions_from_payload(payload);
+
+                {
+                    let mut status = state.ingestor_status.write().await;
+                    status.messages_processed += 1;
+                    status.last_message_unix_ms = Some(now_ms);
+                    status.decode_failures += decode_failures;
+                }
+
+                if buses.is_empty() {
+                    return;
+                }
+
+                match write_buses_to_redis(&mut redis_conn, &buses, now_ms).await {
+                    Ok(written_count) => {
+                        let mut status = state.ingestor_status.write().await;
+                        status.buses_written += written_count as u64;
+                        status.last_error = None;
+                    }
+                    Err(error) => {
+                        let mut status = state.ingestor_status.write().await;
+                        status.redis_write_failures += 1;
+                        status.last_error = Some(format!("Redis write failed: {}", error));
+                    }
+                }
+            }
+            .boxed()
+        };
+
+        let disconnect_state = state.clone();
+        let disconnect_signal = disconnect_notify.clone();
+        let disconnect_state_for_error = state.clone();
+        let disconnect_signal_for_error = disconnect_notify.clone();
+
+        let socket = ClientBuilder::new(SOCKET_URL)
+            .transport_type(TransportType::Websocket)
+            .on_any(on_any)
+            .on("disconnect", move |_, _| {
+                let state = disconnect_state.clone();
+                let notify = disconnect_signal.clone();
+                async move {
+                    {
+                        let mut status = state.ingestor_status.write().await;
+                        status.connected = false;
+                        status.last_error = Some("Socket disconnected".to_string());
+                        status.reconnect_count += 1;
+                    }
+                    notify.notify_one();
+                }
+                .boxed()
+            })
+            .on("error", move |_, _| {
+                let state = disconnect_state_for_error.clone();
+                let notify = disconnect_signal_for_error.clone();
+                async move {
+                    {
+                        let mut status = state.ingestor_status.write().await;
+                        status.connected = false;
+                        status.last_error = Some("Socket error event".to_string());
+                        status.reconnect_count += 1;
+                    }
+                    notify.notify_one();
+                }
+                .boxed()
+            })
+            .connect()
+            .await;
+
+        match socket {
+            Ok(socket) => {
                 let payload = json!({
                     "sid": "",
                     "uid": "",
                     "provider": "RKL",
                     "route": ""
                 });
-                let _ = socket.emit("onFts-reload", payload).await;
+                if let Err(error) = socket.emit("onFts-reload", payload).await {
+                    record_ingestor_error(
+                        &state,
+                        format!("Socket subscribe emit failed: {}", error),
+                        true,
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_secs(backoff_seconds)).await;
+                    backoff_seconds = (backoff_seconds * 2).min(30);
+                    continue;
+                }
+
+                {
+                    let mut status = state.ingestor_status.write().await;
+                    status.connected = true;
+                    status.last_error = None;
+                }
+
+                backoff_seconds = 1;
+                disconnect_notify.notified().await;
+                drop(socket);
             }
-            .boxed()
-        })
-        .connect()
-        .await;
+            Err(error) => {
+                record_ingestor_error(&state, format!("Socket connection failed: {}", error), true)
+                    .await;
+                tokio::time::sleep(Duration::from_secs(backoff_seconds)).await;
+                backoff_seconds = (backoff_seconds * 2).min(30);
+            }
+        }
+    }
+}
 
-    if let Ok(socket) = socket {
-        let payload = json!({
-            "sid": "",
-            "uid": "",
-            "provider": "RKL",
-            "route": ""
-        });
-        let _ = socket.emit("onFts-reload", payload).await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+async fn write_buses_to_redis(
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    buses: &[BusPosition],
+    now_ms: i64,
+) -> Result<usize, String> {
+    let mut serialized_entries: Vec<(String, String)> = Vec::new();
+
+    for bus in buses {
+        if bus.bus_no.is_empty() {
+            continue;
+        }
+
+        if let Ok(serialized_bus) = serde_json::to_string(bus) {
+            serialized_entries.push((bus.bus_no.clone(), serialized_bus));
+        }
     }
 
-    let data = result.lock().await;
-    println!("Calling fetch_all_buses");
-    if data.len() == 1 {
-        Json(data[0].clone())
+    if serialized_entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut pipe = redis::pipe();
+    for (bus_no, bus_json) in &serialized_entries {
+        pipe.cmd("HSET")
+            .arg(REDIS_BUSES_LATEST_KEY)
+            .arg(bus_no)
+            .arg(bus_json)
+            .ignore();
+        pipe.cmd("ZADD")
+            .arg(REDIS_BUSES_LAST_SEEN_KEY)
+            .arg(now_ms)
+            .arg(bus_no)
+            .ignore();
+    }
+
+    pipe.cmd("SET")
+        .arg(REDIS_INGEST_LAST_KEY)
+        .arg(now_ms)
+        .ignore();
+
+    pipe.query_async::<()>(redis_conn)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(serialized_entries.len())
+}
+
+fn parse_bus_positions_from_payload(payload: Payload) -> (Vec<BusPosition>, u64) {
+    let mut buses = Vec::new();
+    let mut decode_failures = 0;
+
+    if let Payload::Text(values) = payload {
+        for value in values {
+            let Some(encoded_str) = value.as_str() else {
+                continue;
+            };
+
+            let Some(decoded) = decode_bus_data(encoded_str) else {
+                decode_failures += 1;
+                continue;
+            };
+
+            match parse_bus_positions_from_json(&decoded) {
+                Some(mut parsed_buses) => buses.append(&mut parsed_buses),
+                None => decode_failures += 1,
+            }
+        }
+    }
+
+    (buses, decode_failures)
+}
+
+fn parse_bus_positions_from_json(decoded: &str) -> Option<Vec<BusPosition>> {
+    if let Ok(single_bus) = serde_json::from_str::<BusPosition>(decoded) {
+        return Some(vec![single_bus]);
+    }
+
+    if let Ok(bus_list) = serde_json::from_str::<Vec<BusPosition>>(decoded) {
+        return Some(bus_list);
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(decoded).ok()?;
+    if let serde_json::Value::Array(entries) = value {
+        let buses: Vec<BusPosition> = entries
+            .into_iter()
+            .filter_map(|entry| serde_json::from_value::<BusPosition>(entry).ok())
+            .collect();
+
+        if buses.is_empty() {
+            None
+        } else {
+            Some(buses)
+        }
     } else {
-        Json(json!(data.clone()))
+        None
     }
+}
+
+async fn record_ingestor_error(state: &AppState, message: String, count_reconnect: bool) {
+    let mut status = state.ingestor_status.write().await;
+    status.connected = false;
+    status.last_error = Some(message);
+    if count_reconnect {
+        status.reconnect_count += 1;
+    }
+}
+
+fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: format!("Internal server error: {}", error),
+        }),
+    )
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // Get buses for route T789 specifically
@@ -235,7 +612,9 @@ async fn get_route_t789() -> Json<serde_json::Value> {
     let result = Arc::new(Mutex::new(Vec::new()));
     let result_clone = result.clone();
 
-    let on_any = move |_event: rust_socketio::Event, payload: Payload, _socket: rust_socketio::asynchronous::Client| {
+    let on_any = move |_event: rust_socketio::Event,
+                       payload: Payload,
+                       _socket: rust_socketio::asynchronous::Client| {
         let result = result_clone.clone();
         async move {
             match payload {
@@ -243,7 +622,9 @@ async fn get_route_t789() -> Json<serde_json::Value> {
                     for value in values {
                         if let Some(encoded_str) = value.as_str() {
                             if let Some(decoded) = decode_bus_data(encoded_str) {
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&decoded) {
+                                if let Ok(json) =
+                                    serde_json::from_str::<serde_json::Value>(&decoded)
+                                {
                                     result.lock().await.push(json);
                                 }
                             }
@@ -306,7 +687,9 @@ async fn get_t789_eta() -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResp
     let result = Arc::new(Mutex::new(Vec::new()));
     let result_clone = result.clone();
 
-    let on_any = move |_event: rust_socketio::Event, payload: Payload, _socket: rust_socketio::asynchronous::Client| {
+    let on_any = move |_event: rust_socketio::Event,
+                       payload: Payload,
+                       _socket: rust_socketio::asynchronous::Client| {
         let result = result_clone.clone();
         async move {
             match payload {
@@ -314,7 +697,9 @@ async fn get_t789_eta() -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResp
                     for value in values {
                         if let Some(encoded_str) = value.as_str() {
                             if let Some(decoded) = decode_bus_data(encoded_str) {
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&decoded) {
+                                if let Ok(json) =
+                                    serde_json::from_str::<serde_json::Value>(&decoded)
+                                {
                                     result.lock().await.push(json);
                                 }
                             }
@@ -375,39 +760,62 @@ async fn get_t789_eta() -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResp
 
     // --- Step 2: Load route stops for T7890 from GTFS data ---
     let routes = load_routes().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            error: format!("Failed to load routes: {}", e),
-        }))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to load routes: {}", e),
+            }),
+        )
     })?;
 
     let trips_by_route = load_trips().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            error: format!("Failed to load trips: {}", e),
-        }))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to load trips: {}", e),
+            }),
+        )
     })?;
 
     let stop_times_by_trip = load_stop_times().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            error: format!("Failed to load stop times: {}", e),
-        }))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to load stop times: {}", e),
+            }),
+        )
     })?;
 
     let stops_map = load_stops().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            error: format!("Failed to load stops: {}", e),
-        }))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to load stops: {}", e),
+            }),
+        )
     })?;
 
-    let route_stops = get_stops_by_route("T7890", &routes, &trips_by_route, &stop_times_by_trip, &stops_map)
-        .map_err(|(status, msg)| (status, Json(ErrorResponse { error: msg })))?;
+    let route_stops = get_stops_by_route(
+        "T7890",
+        &routes,
+        &trips_by_route,
+        &stop_times_by_trip,
+        &stops_map,
+    )
+    .map_err(|(status, msg)| (status, Json(ErrorResponse { error: msg })))?;
 
     // Find the target stop's sequence
-    let target_stop = route_stops.stops.iter()
+    let target_stop = route_stops
+        .stops
+        .iter()
         .find(|s| s.stop_id == TARGET_STOP_ID)
         .ok_or_else(|| {
-            (StatusCode::NOT_FOUND, Json(ErrorResponse {
-                error: format!("Target stop '{}' not found in route stops", TARGET_STOP_ID),
-            }))
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Target stop '{}' not found in route stops", TARGET_STOP_ID),
+                }),
+            )
         })?;
     let target_sequence = target_stop.sequence;
 
@@ -437,7 +845,9 @@ async fn get_t789_eta() -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResp
 
         // Calculate distance: bus position -> next stops -> ... -> target stop
         // Get the stops between current and target (exclusive of current, inclusive of target)
-        let intermediate_stops: Vec<&StopWithDetails> = route_stops.stops.iter()
+        let intermediate_stops: Vec<&StopWithDetails> = route_stops
+            .stops
+            .iter()
             .filter(|s| s.sequence > current_sequence && s.sequence <= target_sequence)
             .collect();
 
@@ -446,13 +856,18 @@ async fn get_t789_eta() -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResp
         let mut prev_lon = bus.longitude;
 
         for stop in &intermediate_stops {
-            total_distance_km += haversine_distance(prev_lat, prev_lon, stop.stop_lat, stop.stop_lon);
+            total_distance_km +=
+                haversine_distance(prev_lat, prev_lon, stop.stop_lat, stop.stop_lon);
             prev_lat = stop.stop_lat;
             prev_lon = stop.stop_lon;
         }
 
         // Calculate ETA: use bus speed if available, otherwise fallback
-        let speed = if bus.speed > 0.0 { bus.speed } else { DEFAULT_SPEED_KMH };
+        let speed = if bus.speed > 0.0 {
+            bus.speed
+        } else {
+            DEFAULT_SPEED_KMH
+        };
         let eta_minutes = (total_distance_km / speed) * 60.0;
 
         eta_results.push(BusEta {
@@ -469,9 +884,16 @@ async fn get_t789_eta() -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResp
     }
 
     // Sort by ETA (closest first)
-    eta_results.sort_by(|a, b| a.eta_minutes.partial_cmp(&b.eta_minutes).unwrap_or(std::cmp::Ordering::Equal));
+    eta_results.sort_by(|a, b| {
+        a.eta_minutes
+            .partial_cmp(&b.eta_minutes)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    println!("Calling get_t789_eta: found {} buses with ETA", eta_results.len());
+    println!(
+        "Calling get_t789_eta: found {} buses with ETA",
+        eta_results.len()
+    );
     Ok(Json(eta_results))
 }
 
@@ -536,7 +958,10 @@ fn load_trips() -> Result<HashMap<String, Vec<Trip>>, Box<dyn std::error::Error>
     let mut trips_by_route: HashMap<String, Vec<Trip>> = HashMap::new();
     for result in rdr.deserialize() {
         let trip: Trip = result?;
-        trips_by_route.entry(trip.route_id.clone()).or_default().push(trip);
+        trips_by_route
+            .entry(trip.route_id.clone())
+            .or_default()
+            .push(trip);
     }
     Ok(trips_by_route)
 }
@@ -550,7 +975,10 @@ fn load_stop_times() -> Result<HashMap<String, Vec<StopTime>>, Box<dyn std::erro
     let mut stop_times_by_trip: HashMap<String, Vec<StopTime>> = HashMap::new();
     for result in rdr.deserialize() {
         let stop_time: StopTime = result?;
-        stop_times_by_trip.entry(stop_time.trip_id.clone()).or_default().push(stop_time);
+        stop_times_by_trip
+            .entry(stop_time.trip_id.clone())
+            .or_default()
+            .push(stop_time);
     }
     Ok(stop_times_by_trip)
 }
@@ -581,18 +1009,29 @@ fn get_stops_by_route(
     let route = routes
         .iter()
         .find(|r| r.route_id == route_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Route '{}' not found", route_id)))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Route '{}' not found", route_id),
+            )
+        })?;
 
     // Get trips for this route
-    let trips = trips_by_route
-        .get(route_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No trips found for route '{}'", route_id)))?;
+    let trips = trips_by_route.get(route_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("No trips found for route '{}'", route_id),
+        )
+    })?;
 
     // Get the first trip's stop times
     let first_trip = &trips[0];
-    let stop_times = stop_times_by_trip
-        .get(&first_trip.trip_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("No stop times found for trip '{}'", first_trip.trip_id)))?;
+    let stop_times = stop_times_by_trip.get(&first_trip.trip_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("No stop times found for trip '{}'", first_trip.trip_id),
+        )
+    })?;
 
     // Sort by stop_sequence
     let mut sorted_stop_times: Vec<&StopTime> = stop_times.iter().collect();
@@ -622,45 +1061,65 @@ fn get_stops_by_route(
 }
 
 // Axum handler for /route/:route_id/stops
-async fn get_route_stops(Path(route_id): Path<String>) -> Result<Json<RouteStopsResponse>, (StatusCode, Json<ErrorResponse>)> {
+async fn get_route_stops(
+    Path(route_id): Path<String>,
+) -> Result<Json<RouteStopsResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Load GTFS data
     let routes = match load_routes() {
         Ok(r) => r,
         Err(e) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                error: format!("Failed to load routes: {}", e),
-            })));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load routes: {}", e),
+                }),
+            ));
         }
     };
 
     let trips_by_route = match load_trips() {
         Ok(t) => t,
         Err(e) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                error: format!("Failed to load trips: {}", e),
-            })));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load trips: {}", e),
+                }),
+            ));
         }
     };
 
     let stop_times_by_trip = match load_stop_times() {
         Ok(st) => st,
         Err(e) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                error: format!("Failed to load stop times: {}", e),
-            })));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load stop times: {}", e),
+                }),
+            ));
         }
     };
 
     let stops_map = match load_stops() {
         Ok(s) => s,
         Err(e) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                error: format!("Failed to load stops: {}", e),
-            })));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load stops: {}", e),
+                }),
+            ));
         }
     };
 
-    match get_stops_by_route(&route_id, &routes, &trips_by_route, &stop_times_by_trip, &stops_map) {
+    match get_stops_by_route(
+        &route_id,
+        &routes,
+        &trips_by_route,
+        &stop_times_by_trip,
+        &stops_map,
+    ) {
         Ok(response) => {
             println!("Calling get_route_stops for route_id={}", route_id);
             Ok(Json(response))
@@ -694,7 +1153,8 @@ async fn get_nearest_stop(
     let nearest_stop = stops_map
         .values()
         .map(|stop| {
-            let distance_km = haversine_distance(query.lat, query.lon, stop.stop_lat, stop.stop_lon);
+            let distance_km =
+                haversine_distance(query.lat, query.lon, stop.stop_lat, stop.stop_lon);
             (stop, distance_km)
         })
         .min_by(|(_, left_distance), (_, right_distance)| {

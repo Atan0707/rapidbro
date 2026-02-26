@@ -1,6 +1,14 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { AlertTriangle, LoaderCircle, LocateFixed, MapPin } from 'lucide-react'
 import { useMemo, useState } from 'react'
+import { Button } from '@/components/ui/button'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
 
 export const Route = createFileRoute('/')({ component: App })
 
@@ -25,7 +33,9 @@ function App() {
     [],
   )
   const [coords, setCoords] = useState<UserCoords | null>(null)
-  const [nearestStop, setNearestStop] = useState<NearestStopResponse | null>(null)
+  const [nearestStop, setNearestStop] = useState<NearestStopResponse | null>(
+    null,
+  )
   const [isLoading, setIsLoading] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
@@ -34,12 +44,14 @@ function App() {
       lat: lat.toString(),
       lon: lon.toString(),
     })
-    const response = await fetch(`${apiBaseUrl}/stops/nearest?${params.toString()}`)
+    const response = await fetch(
+      `${apiBaseUrl}/stops/nearest?${params.toString()}`,
+    )
     if (!response.ok) {
       const fallbackMessage = 'Unable to fetch nearest bus stop'
-      const body = (await response.json().catch(() => null)) as
-        | { error?: string }
-        | null
+      const body = (await response.json().catch(() => null)) as {
+        error?: string
+      } | null
       throw new Error(body?.error ?? fallbackMessage)
     }
 
@@ -89,70 +101,87 @@ function App() {
   }
 
   return (
-    <main className="min-h-screen bg-slate-950 text-white px-6 py-12">
-      <section className="mx-auto max-w-3xl">
-        <div className="rounded-2xl border border-slate-700 bg-slate-900/80 p-8 shadow-xl">
-          <h1 className="text-3xl font-bold mb-3">Nearest Bus Stop Finder</h1>
-          <p className="text-slate-300 mb-6">
-            Get your current coordinates from the browser, then ask the backend
-            for the closest GTFS bus stop.
-          </p>
-
-          <button
+    <main className="mx-auto max-w-4xl p-4 md:p-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>Nearest Bus Stop Finder</CardTitle>
+          <CardDescription>
+            Get your current coordinates from the browser, then fetch the
+            closest GTFS stop from the backend.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Button
             type="button"
             onClick={handleFindNearestStop}
             disabled={isLoading}
-            className="inline-flex items-center gap-2 rounded-lg bg-cyan-500 px-5 py-3 font-semibold text-slate-950 hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isLoading ? (
-              <LoaderCircle className="h-5 w-5 animate-spin" />
+              <>
+                <LoaderCircle className="animate-spin" />
+                Finding...
+              </>
             ) : (
-              <LocateFixed className="h-5 w-5" />
+              <>
+                <LocateFixed />
+                Find nearest stop
+              </>
             )}
-            {isLoading ? 'Finding...' : 'Find nearest stop'}
-          </button>
+          </Button>
 
-          {errorMessage && (
-            <div className="mt-5 rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-red-100">
-              <div className="flex items-center gap-2 font-semibold mb-1">
+          {errorMessage ? (
+            <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3">
+              <p className="inline-flex items-center gap-2 text-sm font-medium text-destructive">
                 <AlertTriangle className="h-4 w-4" />
                 Error
-              </div>
-              <p>{errorMessage}</p>
+              </p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {errorMessage}
+              </p>
             </div>
-          )}
+          ) : null}
 
-          {coords && (
-            <div className="mt-6 rounded-lg border border-slate-700 bg-slate-800/70 p-4">
-              <h2 className="font-semibold text-cyan-300 mb-2">Your location</h2>
-              <p className="text-sm text-slate-300">
+          {coords ? (
+            <div className="rounded-md border bg-muted/40 p-3">
+              <p className="text-sm font-medium">Your location</p>
+              <p className="mt-1 text-sm text-muted-foreground">
                 Latitude: {coords.lat.toFixed(6)} | Longitude:{' '}
                 {coords.lon.toFixed(6)}
               </p>
             </div>
-          )}
+          ) : null}
 
-          {nearestStop && (
-            <div className="mt-6 rounded-lg border border-cyan-500/40 bg-cyan-500/10 p-4">
-              <h2 className="flex items-center gap-2 font-semibold text-cyan-300 mb-2">
-                <MapPin className="h-5 w-5" />
+          {nearestStop ? (
+            <div className="rounded-md border p-4">
+              <p className="inline-flex items-center gap-2 text-sm font-medium">
+                <MapPin className="h-4 w-4" />
                 Nearest stop
-              </h2>
-              <p className="text-lg font-bold">{nearestStop.stop_name}</p>
-              <p className="text-sm text-slate-300 mb-2">
+              </p>
+              <p className="mt-2 text-lg font-semibold">
+                {nearestStop.stop_name}
+              </p>
+              <p className="text-sm text-muted-foreground">
                 Stop ID: {nearestStop.stop_id}
               </p>
-              <p className="text-sm text-slate-300 mb-2">
+              <p className="mt-1 text-sm text-muted-foreground">
                 {nearestStop.stop_desc || 'No stop description'}
               </p>
-              <p className="text-sm text-slate-200">
+              <p className="mt-2 text-sm">
                 Distance: {nearestStop.distance_meters.toFixed(1)} m (
                 {nearestStop.distance_km.toFixed(3)} km)
               </p>
             </div>
+          ) : (
+            <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+              Tap{' '}
+              <span className="font-medium text-foreground">
+                Find nearest stop
+              </span>{' '}
+              to begin.
+            </div>
           )}
-        </div>
-      </section>
+        </CardContent>
+      </Card>
     </main>
   )
 }
