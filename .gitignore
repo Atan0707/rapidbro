@@ -18,3 +18,5 @@ Thumbs.db
 .env.local
 
 be/Cargo.lock
+
+dumb.rdb
