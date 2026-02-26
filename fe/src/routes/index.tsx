@@ -42,6 +42,19 @@ type GetAllResponse = {
   meta: GetAllMeta
 }
 
+type BusEta = {
+  route_id: string
+  bus_no: string
+  current_lat: number
+  current_lon: number
+  current_stop_id: string
+  current_sequence: number
+  stops_away: number
+  distance_km: number
+  speed_kmh: number
+  eta_minutes: number
+}
+
 type UserCoords = {
   lat: number
   lon: number
@@ -56,10 +69,13 @@ function App() {
   const [nearestStop, setNearestStop] = useState<NearestStopResponse | null>(
     null,
   )
+  const [nearestStopEta, setNearestStopEta] = useState<BusEta[]>([])
   const [busSnapshot, setBusSnapshot] = useState<GetAllResponse | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [isLoadingEta, setIsLoadingEta] = useState(false)
   const [isLoadingBuses, setIsLoadingBuses] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [etaErrorMessage, setEtaErrorMessage] = useState<string | null>(null)
   const [busErrorMessage, setBusErrorMessage] = useState<string | null>(null)
 
   const fetchNearestStop = async (lat: number, lon: number) => {
@@ -80,11 +96,44 @@ function App() {
 
     const data = (await response.json()) as NearestStopResponse
     setNearestStop(data)
+    return data
+  }
+
+  const fetchEtaToStop = async (stopId: string) => {
+    setEtaErrorMessage(null)
+    setNearestStopEta([])
+    setIsLoadingEta(true)
+
+    try {
+      const response = await fetch(
+        `${apiBaseUrl}/stops/${encodeURIComponent(stopId)}/eta`,
+      )
+      if (!response.ok) {
+        const fallbackMessage = 'Unable to fetch ETA for nearest stop'
+        const body = (await response.json().catch(() => null)) as {
+          error?: string
+        } | null
+        throw new Error(body?.error ?? fallbackMessage)
+      }
+
+      const data = (await response.json()) as BusEta[]
+      setNearestStopEta(data)
+    } catch (error) {
+      setEtaErrorMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to fetch ETA for nearest stop',
+      )
+    } finally {
+      setIsLoadingEta(false)
+    }
   }
 
   const handleFindNearestStop = () => {
     setErrorMessage(null)
+    setEtaErrorMessage(null)
     setNearestStop(null)
+    setNearestStopEta([])
     setIsLoading(true)
 
     if (!('geolocation' in navigator)) {
@@ -100,7 +149,8 @@ function App() {
         setCoords({ lat, lon })
 
         try {
-          await fetchNearestStop(lat, lon)
+          const nearestStopData = await fetchNearestStop(lat, lon)
+          await fetchEtaToStop(nearestStopData.stop_id)
         } catch (error) {
           setErrorMessage(
             error instanceof Error
@@ -218,6 +268,50 @@ function App() {
                 Distance: {nearestStop.distance_meters.toFixed(1)} m (
                 {nearestStop.distance_km.toFixed(3)} km)
               </p>
+
+              <div className="mt-4 rounded-md border bg-muted/30 p-3">
+                <p className="text-sm font-medium">
+                  ETA to this stop (all routes)
+                </p>
+                {isLoadingEta ? (
+                  <p className="mt-2 inline-flex items-center gap-2 text-sm text-muted-foreground">
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                    Loading ETA...
+                  </p>
+                ) : null}
+
+                {etaErrorMessage ? (
+                  <p className="mt-2 text-sm text-destructive">
+                    {etaErrorMessage}
+                  </p>
+                ) : null}
+
+                {!isLoadingEta &&
+                !etaErrorMessage &&
+                nearestStopEta.length === 0 ? (
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    No active buses heading to this stop right now.
+                  </p>
+                ) : null}
+
+                {!isLoadingEta && nearestStopEta.length > 0 ? (
+                  <div className="mt-2 space-y-2">
+                    {nearestStopEta.slice(0, 5).map((eta) => (
+                      <div
+                        key={`${eta.bus_no}-${eta.current_stop_id}`}
+                        className="rounded border bg-background p-2 text-sm"
+                      >
+                        <p className="font-medium">Bus {eta.bus_no}</p>
+                        <p className="text-muted-foreground">
+                          Route {eta.route_id} · ETA{' '}
+                          {eta.eta_minutes.toFixed(1)} min · {eta.stops_away}{' '}
+                          stops away · {eta.distance_km.toFixed(2)} km
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
             </div>
           ) : (
             <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">

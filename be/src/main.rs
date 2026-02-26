@@ -11,7 +11,7 @@ use prost::Message;
 use rust_socketio::{asynchronous::ClientBuilder, Payload, TransportType};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::Read;
@@ -125,6 +125,7 @@ struct ErrorResponse {
 
 #[derive(Debug, Clone, Serialize)]
 struct BusEta {
+    route_id: String,
     bus_no: String,
     current_lat: f64,
     current_lon: f64,
@@ -175,6 +176,13 @@ struct RedisBusSnapshot {
     buses: Vec<BusPosition>,
     active_bus_count: usize,
     last_ingest_at_unix_ms: Option<i64>,
+}
+
+struct GtfsContext {
+    routes: Vec<Route>,
+    trips_by_route: HashMap<String, Vec<Trip>>,
+    stop_times_by_trip: HashMap<String, Vec<StopTime>>,
+    stops_map: HashMap<String, Stop>,
 }
 
 const SOCKET_URL: &str = "https://rapidbus-socketio-avl.prasarana.com.my";
@@ -247,6 +255,8 @@ async fn main() {
         .route("/ingestor/status", get(get_ingestor_status))
         .route("/get-route-t789", get(get_route_t789))
         .route("/get-t789-eta", get(get_t789_eta))
+        .route("/route/{route_id}/eta/{stop_id}", get(get_route_eta))
+        .route("/stops/{stop_id}/eta", get(get_stop_eta))
         .route("/route/{route_id}/stops", get(get_route_stops))
         .route("/stops/nearest", get(get_nearest_stop))
         .layer(cors)
@@ -647,8 +657,21 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorRespo
 }
 
 fn is_t789_route(route: &str) -> bool {
-    let normalized = route.trim().to_uppercase();
-    normalized == "T789" || normalized == "T7890" || normalized.starts_with("T789")
+    normalize_route_code(route) == "T789"
+}
+
+fn is_bus_on_route(bus_route: &str, route_id: &str) -> bool {
+    let bus_base = normalize_route_code(bus_route);
+    let route_base = normalize_route_code(route_id);
+    !bus_base.is_empty() && bus_base == route_base
+}
+
+fn normalize_route_code(route: &str) -> String {
+    route
+        .trim()
+        .to_uppercase()
+        .trim_end_matches('0')
+        .to_string()
 }
 
 fn now_unix_ms() -> i64 {
@@ -688,17 +711,205 @@ async fn get_t789_eta(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResponse>)> {
     const TARGET_STOP_ID: &str = "1000838";
+    let eta_results = calculate_route_eta(&state, "T7890", TARGET_STOP_ID).await?;
+    println!(
+        "Calling get_t789_eta: found {} buses with ETA",
+        eta_results.len()
+    );
+    Ok(Json(eta_results))
+}
+
+// Calculate ETA for buses in route/{route_id} to reach stop/{stop_id}, based on Redis snapshot.
+async fn get_route_eta(
+    Path((route_id, stop_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResponse>)> {
+    let eta_results = calculate_route_eta(&state, &route_id, &stop_id).await?;
+    println!(
+        "Calling get_route_eta for route_id={}, stop_id={}: {} buses",
+        route_id,
+        stop_id,
+        eta_results.len()
+    );
+    Ok(Json(eta_results))
+}
+
+// Calculate ETA for all routes incoming to /stops/{stop_id}
+async fn get_stop_eta(
+    Path(stop_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = load_active_bus_snapshot(&state).await?;
+    let gtfs = load_gtfs_context()?;
+
+    let mut all_eta_results: Vec<BusEta> = Vec::new();
+    let mut seen_bus_route: HashSet<String> = HashSet::new();
+
+    for route in &gtfs.routes {
+        let route_stops = match get_stops_by_route(
+            &route.route_id,
+            &gtfs.routes,
+            &gtfs.trips_by_route,
+            &gtfs.stop_times_by_trip,
+            &gtfs.stops_map,
+        ) {
+            Ok(stops) => stops,
+            Err(_) => continue,
+        };
+
+        if !route_stops.stops.iter().any(|stop| stop.stop_id == stop_id) {
+            continue;
+        }
+
+        let route_eta_results = match calculate_route_eta_from_stops(
+            &snapshot.buses,
+            &route.route_id,
+            &stop_id,
+            &route_stops,
+        ) {
+            Ok(results) => results,
+            Err(_) => continue,
+        };
+
+        for eta in route_eta_results {
+            let key = format!("{}::{}", eta.route_id, eta.bus_no);
+            if seen_bus_route.insert(key) {
+                all_eta_results.push(eta);
+            }
+        }
+    }
+
+    all_eta_results.sort_by(|a, b| {
+        a.eta_minutes
+            .partial_cmp(&b.eta_minutes)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    println!(
+        "Calling get_stop_eta for stop_id={}: {} incoming buses",
+        stop_id,
+        all_eta_results.len()
+    );
+    Ok(Json(all_eta_results))
+}
+
+async fn calculate_route_eta(
+    state: &AppState,
+    route_id: &str,
+    target_stop_id: &str,
+) -> Result<Vec<BusEta>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = load_active_bus_snapshot(state).await?;
+    let gtfs = load_gtfs_context()?;
+    let route_stops = get_stops_by_route(
+        route_id,
+        &gtfs.routes,
+        &gtfs.trips_by_route,
+        &gtfs.stop_times_by_trip,
+        &gtfs.stops_map,
+    )
+    .map_err(|(status, msg)| (status, Json(ErrorResponse { error: msg })))?;
+
+    calculate_route_eta_from_stops(&snapshot.buses, route_id, target_stop_id, &route_stops).map_err(
+        |message| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse { error: message }),
+            )
+        },
+    )
+}
+
+fn calculate_route_eta_from_stops(
+    buses: &[BusPosition],
+    route_id: &str,
+    target_stop_id: &str,
+    route_stops: &RouteStopsResponse,
+) -> Result<Vec<BusEta>, String> {
     const DEFAULT_SPEED_KMH: f64 = 20.0;
 
-    // --- Step 1: Read live bus positions from Redis snapshot ---
-    let snapshot = load_active_bus_snapshot(&state).await?;
-    let buses: Vec<BusPosition> = snapshot
-        .buses
-        .into_iter()
-        .filter(|bus| is_t789_route(&bus.route))
-        .collect();
+    let target_stop = route_stops
+        .stops
+        .iter()
+        .find(|s| s.stop_id == target_stop_id)
+        .ok_or_else(|| {
+            format!(
+                "Target stop '{}' not found in route '{}'",
+                target_stop_id, route_id
+            )
+        })?;
+    let target_sequence = target_stop.sequence;
 
-    // --- Step 2: Load route stops for T7890 from GTFS data ---
+    let mut eta_results: Vec<BusEta> = Vec::new();
+
+    for bus in buses
+        .iter()
+        .filter(|bus| is_bus_on_route(&bus.route, route_id))
+    {
+        let bus_stop_id = match &bus.busstop_id {
+            Some(id) if !id.is_empty() => id.clone(),
+            _ => continue,
+        };
+
+        let current_stop = match route_stops.stops.iter().find(|s| s.stop_id == bus_stop_id) {
+            Some(stop) => stop,
+            None => continue,
+        };
+
+        let current_sequence = current_stop.sequence;
+        if current_sequence >= target_sequence {
+            continue;
+        }
+
+        let stops_away = target_sequence - current_sequence;
+
+        let intermediate_stops: Vec<&StopWithDetails> = route_stops
+            .stops
+            .iter()
+            .filter(|s| s.sequence > current_sequence && s.sequence <= target_sequence)
+            .collect();
+
+        let mut total_distance_km = 0.0;
+        let mut prev_lat = bus.latitude;
+        let mut prev_lon = bus.longitude;
+
+        for stop in &intermediate_stops {
+            total_distance_km +=
+                haversine_distance(prev_lat, prev_lon, stop.stop_lat, stop.stop_lon);
+            prev_lat = stop.stop_lat;
+            prev_lon = stop.stop_lon;
+        }
+
+        let speed = if bus.speed > 0.0 {
+            bus.speed
+        } else {
+            DEFAULT_SPEED_KMH
+        };
+        let eta_minutes = (total_distance_km / speed) * 60.0;
+
+        eta_results.push(BusEta {
+            route_id: route_id.to_string(),
+            bus_no: bus.bus_no.clone(),
+            current_lat: bus.latitude,
+            current_lon: bus.longitude,
+            current_stop_id: bus_stop_id,
+            current_sequence,
+            stops_away,
+            distance_km: (total_distance_km * 100.0).round() / 100.0,
+            speed_kmh: bus.speed,
+            eta_minutes: (eta_minutes * 10.0).round() / 10.0,
+        });
+    }
+
+    eta_results.sort_by(|a, b| {
+        a.eta_minutes
+            .partial_cmp(&b.eta_minutes)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(eta_results)
+}
+
+fn load_gtfs_context() -> Result<GtfsContext, (StatusCode, Json<ErrorResponse>)> {
     let routes = load_routes().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -735,106 +946,12 @@ async fn get_t789_eta(
         )
     })?;
 
-    let route_stops = get_stops_by_route(
-        "T7890",
-        &routes,
-        &trips_by_route,
-        &stop_times_by_trip,
-        &stops_map,
-    )
-    .map_err(|(status, msg)| (status, Json(ErrorResponse { error: msg })))?;
-
-    // Find the target stop's sequence
-    let target_stop = route_stops
-        .stops
-        .iter()
-        .find(|s| s.stop_id == TARGET_STOP_ID)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Target stop '{}' not found in route stops", TARGET_STOP_ID),
-                }),
-            )
-        })?;
-    let target_sequence = target_stop.sequence;
-
-    // --- Step 3: Calculate ETA for each bus ---
-    let mut eta_results: Vec<BusEta> = Vec::new();
-
-    for bus in &buses {
-        let bus_stop_id = match &bus.busstop_id {
-            Some(id) if !id.is_empty() => id.clone(),
-            _ => continue, // Skip buses without a known stop
-        };
-
-        // Find the bus's current stop in the route sequence
-        let current_stop = match route_stops.stops.iter().find(|s| s.stop_id == bus_stop_id) {
-            Some(stop) => stop,
-            None => continue, // Bus is at a stop not on this route, skip
-        };
-
-        let current_sequence = current_stop.sequence;
-
-        // Skip buses that have already passed the target stop
-        if current_sequence >= target_sequence {
-            continue;
-        }
-
-        let stops_away = target_sequence - current_sequence;
-
-        // Calculate distance: bus position -> next stops -> ... -> target stop
-        // Get the stops between current and target (exclusive of current, inclusive of target)
-        let intermediate_stops: Vec<&StopWithDetails> = route_stops
-            .stops
-            .iter()
-            .filter(|s| s.sequence > current_sequence && s.sequence <= target_sequence)
-            .collect();
-
-        let mut total_distance_km = 0.0;
-        let mut prev_lat = bus.latitude;
-        let mut prev_lon = bus.longitude;
-
-        for stop in &intermediate_stops {
-            total_distance_km +=
-                haversine_distance(prev_lat, prev_lon, stop.stop_lat, stop.stop_lon);
-            prev_lat = stop.stop_lat;
-            prev_lon = stop.stop_lon;
-        }
-
-        // Calculate ETA: use bus speed if available, otherwise fallback
-        let speed = if bus.speed > 0.0 {
-            bus.speed
-        } else {
-            DEFAULT_SPEED_KMH
-        };
-        let eta_minutes = (total_distance_km / speed) * 60.0;
-
-        eta_results.push(BusEta {
-            bus_no: bus.bus_no.clone(),
-            current_lat: bus.latitude,
-            current_lon: bus.longitude,
-            current_stop_id: bus_stop_id,
-            current_sequence,
-            stops_away,
-            distance_km: (total_distance_km * 100.0).round() / 100.0,
-            speed_kmh: bus.speed,
-            eta_minutes: (eta_minutes * 10.0).round() / 10.0,
-        });
-    }
-
-    // Sort by ETA (closest first)
-    eta_results.sort_by(|a, b| {
-        a.eta_minutes
-            .partial_cmp(&b.eta_minutes)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    println!(
-        "Calling get_t789_eta: found {} buses with ETA",
-        eta_results.len()
-    );
-    Ok(Json(eta_results))
+    Ok(GtfsContext {
+        routes,
+        trips_by_route,
+        stop_times_by_trip,
+        stops_map,
+    })
 }
 
 // Decode base64 + gzip compressed data from the websocket
