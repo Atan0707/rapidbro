@@ -1,5 +1,5 @@
 use axum::{
-    extract::Path,
+    extract::{Path, Query},
     http::StatusCode,
     routing::get,
     Json, Router,
@@ -97,6 +97,23 @@ struct RouteStopsResponse {
     stops: Vec<StopWithDetails>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NearestStopQuery {
+    lat: f64,
+    lon: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct NearestStopResponse {
+    stop_id: String,
+    stop_name: String,
+    stop_desc: String,
+    stop_lat: f64,
+    stop_lon: f64,
+    distance_km: f64,
+    distance_meters: f64,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
@@ -132,6 +149,7 @@ async fn main() {
     .route("/get-route-t789", get(get_route_t789))
     .route("/get-t789-eta", get(get_t789_eta))
     .route("/route/{route_id}/stops", get(get_route_stops))
+    .route("/stops/nearest", get(get_nearest_stop))
     .layer(cors);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3030")
@@ -649,4 +667,64 @@ async fn get_route_stops(Path(route_id): Path<String>) -> Result<Json<RouteStops
         }
         Err((status, message)) => Err((status, Json(ErrorResponse { error: message }))),
     }
+}
+
+// Axum handler for /stops/nearest?lat={lat}&lon={lon}
+async fn get_nearest_stop(
+    Query(query): Query<NearestStopQuery>,
+) -> Result<Json<NearestStopResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !(-90.0..=90.0).contains(&query.lat) || !(-180.0..=180.0).contains(&query.lon) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid latitude/longitude values".to_string(),
+            }),
+        ));
+    }
+
+    let stops_map = load_stops().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to load stops: {}", e),
+            }),
+        )
+    })?;
+
+    let nearest_stop = stops_map
+        .values()
+        .map(|stop| {
+            let distance_km = haversine_distance(query.lat, query.lon, stop.stop_lat, stop.stop_lon);
+            (stop, distance_km)
+        })
+        .min_by(|(_, left_distance), (_, right_distance)| {
+            left_distance
+                .partial_cmp(right_distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "No stops available".to_string(),
+                }),
+            )
+        })?;
+
+    let (stop, distance_km) = nearest_stop;
+    let response = NearestStopResponse {
+        stop_id: stop.stop_id.clone(),
+        stop_name: stop.stop_name.clone(),
+        stop_desc: stop.stop_desc.clone(),
+        stop_lat: stop.stop_lat,
+        stop_lon: stop.stop_lon,
+        distance_km: (distance_km * 1000.0).round() / 1000.0,
+        distance_meters: (distance_km * 1000.0 * 10.0).round() / 10.0,
+    };
+
+    println!(
+        "Calling get_nearest_stop for lat={}, lon={} -> stop_id={}",
+        query.lat, query.lon, response.stop_id
+    );
+    Ok(Json(response))
 }

@@ -1,118 +1,158 @@
 import { createFileRoute } from '@tanstack/react-router'
-import {
-  Zap,
-  Server,
-  Route as RouteIcon,
-  Shield,
-  Waves,
-  Sparkles,
-} from 'lucide-react'
+import { AlertTriangle, LoaderCircle, LocateFixed, MapPin } from 'lucide-react'
+import { useMemo, useState } from 'react'
 
 export const Route = createFileRoute('/')({ component: App })
 
+type NearestStopResponse = {
+  stop_id: string
+  stop_name: string
+  stop_desc: string
+  stop_lat: number
+  stop_lon: number
+  distance_km: number
+  distance_meters: number
+}
+
+type UserCoords = {
+  lat: number
+  lon: number
+}
+
 function App() {
-  const features = [
-    {
-      icon: <Zap className="w-12 h-12 text-cyan-400" />,
-      title: 'Powerful Server Functions',
-      description:
-        'Write server-side code that seamlessly integrates with your client components. Type-safe, secure, and simple.',
-    },
-    {
-      icon: <Server className="w-12 h-12 text-cyan-400" />,
-      title: 'Flexible Server Side Rendering',
-      description:
-        'Full-document SSR, streaming, and progressive enhancement out of the box. Control exactly what renders where.',
-    },
-    {
-      icon: <RouteIcon className="w-12 h-12 text-cyan-400" />,
-      title: 'API Routes',
-      description:
-        'Build type-safe API endpoints alongside your application. No separate backend needed.',
-    },
-    {
-      icon: <Shield className="w-12 h-12 text-cyan-400" />,
-      title: 'Strongly Typed Everything',
-      description:
-        'End-to-end type safety from server to client. Catch errors before they reach production.',
-    },
-    {
-      icon: <Waves className="w-12 h-12 text-cyan-400" />,
-      title: 'Full Streaming Support',
-      description:
-        'Stream data from server to client progressively. Perfect for AI applications and real-time updates.',
-    },
-    {
-      icon: <Sparkles className="w-12 h-12 text-cyan-400" />,
-      title: 'Next Generation Ready',
-      description:
-        'Built from the ground up for modern web applications. Deploy anywhere JavaScript runs.',
-    },
-  ]
+  const apiBaseUrl = useMemo(
+    () => import.meta.env.VITE_BE_URL ?? 'http://localhost:3030',
+    [],
+  )
+  const [coords, setCoords] = useState<UserCoords | null>(null)
+  const [nearestStop, setNearestStop] = useState<NearestStopResponse | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+
+  const fetchNearestStop = async (lat: number, lon: number) => {
+    const params = new URLSearchParams({
+      lat: lat.toString(),
+      lon: lon.toString(),
+    })
+    const response = await fetch(`${apiBaseUrl}/stops/nearest?${params.toString()}`)
+    if (!response.ok) {
+      const fallbackMessage = 'Unable to fetch nearest bus stop'
+      const body = (await response.json().catch(() => null)) as
+        | { error?: string }
+        | null
+      throw new Error(body?.error ?? fallbackMessage)
+    }
+
+    const data = (await response.json()) as NearestStopResponse
+    setNearestStop(data)
+  }
+
+  const handleFindNearestStop = () => {
+    setErrorMessage(null)
+    setNearestStop(null)
+    setIsLoading(true)
+
+    if (!('geolocation' in navigator)) {
+      setIsLoading(false)
+      setErrorMessage('Geolocation is not supported by this browser.')
+      return
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      async (position) => {
+        const lat = position.coords.latitude
+        const lon = position.coords.longitude
+        setCoords({ lat, lon })
+
+        try {
+          await fetchNearestStop(lat, lon)
+        } catch (error) {
+          setErrorMessage(
+            error instanceof Error
+              ? error.message
+              : 'Unable to fetch nearest bus stop',
+          )
+        } finally {
+          setIsLoading(false)
+        }
+      },
+      (error) => {
+        setIsLoading(false)
+        setErrorMessage(error.message || 'Unable to read your location.')
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 30000,
+      },
+    )
+  }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900">
-      <section className="relative py-20 px-6 text-center overflow-hidden">
-        <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/10 via-blue-500/10 to-purple-500/10"></div>
-        <div className="relative max-w-5xl mx-auto">
-          <div className="flex items-center justify-center gap-6 mb-6">
-            <img
-              src="/tanstack-circle-logo.png"
-              alt="TanStack Logo"
-              className="w-24 h-24 md:w-32 md:h-32"
-            />
-            <h1 className="text-6xl md:text-7xl font-black text-white [letter-spacing:-0.08em]">
-              <span className="text-gray-300">TANSTACK</span>{' '}
-              <span className="bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
-                START
-              </span>
-            </h1>
-          </div>
-          <p className="text-2xl md:text-3xl text-gray-300 mb-4 font-light">
-            The framework for next generation AI applications
+    <main className="min-h-screen bg-slate-950 text-white px-6 py-12">
+      <section className="mx-auto max-w-3xl">
+        <div className="rounded-2xl border border-slate-700 bg-slate-900/80 p-8 shadow-xl">
+          <h1 className="text-3xl font-bold mb-3">Nearest Bus Stop Finder</h1>
+          <p className="text-slate-300 mb-6">
+            Get your current coordinates from the browser, then ask the backend
+            for the closest GTFS bus stop.
           </p>
-          <p className="text-lg text-gray-400 max-w-3xl mx-auto mb-8">
-            Full-stack framework powered by TanStack Router for React and Solid.
-            Build modern applications with server functions, streaming, and type
-            safety.
-          </p>
-          <div className="flex flex-col items-center gap-4">
-            <a
-              href="https://tanstack.com/start"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="px-8 py-3 bg-cyan-500 hover:bg-cyan-600 text-white font-semibold rounded-lg transition-colors shadow-lg shadow-cyan-500/50"
-            >
-              Documentation
-            </a>
-            <p className="text-gray-400 text-sm mt-2">
-              Begin your TanStack Start journey by editing{' '}
-              <code className="px-2 py-1 bg-slate-700 rounded text-cyan-400">
-                /src/routes/index.tsx
-              </code>
-            </p>
-          </div>
-        </div>
-      </section>
 
-      <section className="py-16 px-6 max-w-7xl mx-auto">
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {features.map((feature, index) => (
-            <div
-              key={index}
-              className="bg-slate-800/50 backdrop-blur-sm border border-slate-700 rounded-xl p-6 hover:border-cyan-500/50 transition-all duration-300 hover:shadow-lg hover:shadow-cyan-500/10"
-            >
-              <div className="mb-4">{feature.icon}</div>
-              <h3 className="text-xl font-semibold text-white mb-3">
-                {feature.title}
-              </h3>
-              <p className="text-gray-400 leading-relaxed">
-                {feature.description}
+          <button
+            type="button"
+            onClick={handleFindNearestStop}
+            disabled={isLoading}
+            className="inline-flex items-center gap-2 rounded-lg bg-cyan-500 px-5 py-3 font-semibold text-slate-950 hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isLoading ? (
+              <LoaderCircle className="h-5 w-5 animate-spin" />
+            ) : (
+              <LocateFixed className="h-5 w-5" />
+            )}
+            {isLoading ? 'Finding...' : 'Find nearest stop'}
+          </button>
+
+          {errorMessage && (
+            <div className="mt-5 rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-red-100">
+              <div className="flex items-center gap-2 font-semibold mb-1">
+                <AlertTriangle className="h-4 w-4" />
+                Error
+              </div>
+              <p>{errorMessage}</p>
+            </div>
+          )}
+
+          {coords && (
+            <div className="mt-6 rounded-lg border border-slate-700 bg-slate-800/70 p-4">
+              <h2 className="font-semibold text-cyan-300 mb-2">Your location</h2>
+              <p className="text-sm text-slate-300">
+                Latitude: {coords.lat.toFixed(6)} | Longitude:{' '}
+                {coords.lon.toFixed(6)}
               </p>
             </div>
-          ))}
+          )}
+
+          {nearestStop && (
+            <div className="mt-6 rounded-lg border border-cyan-500/40 bg-cyan-500/10 p-4">
+              <h2 className="flex items-center gap-2 font-semibold text-cyan-300 mb-2">
+                <MapPin className="h-5 w-5" />
+                Nearest stop
+              </h2>
+              <p className="text-lg font-bold">{nearestStop.stop_name}</p>
+              <p className="text-sm text-slate-300 mb-2">
+                Stop ID: {nearestStop.stop_id}
+              </p>
+              <p className="text-sm text-slate-300 mb-2">
+                {nearestStop.stop_desc || 'No stop description'}
+              </p>
+              <p className="text-sm text-slate-200">
+                Distance: {nearestStop.distance_meters.toFixed(1)} m (
+                {nearestStop.distance_km.toFixed(3)} km)
+              </p>
+            </div>
+          )}
         </div>
       </section>
-    </div>
+    </main>
   )
 }
