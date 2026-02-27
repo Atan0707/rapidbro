@@ -184,6 +184,26 @@ struct GetAllResponse {
     meta: GetAllMeta,
 }
 
+#[derive(Debug, Serialize)]
+struct StopIncomingMeta {
+    source: &'static str,
+    generated_at_unix_ms: i64,
+    last_ingest_at_unix_ms: Option<i64>,
+    is_stale: bool,
+    active_bus_count: usize,
+    incoming_bus_count: usize,
+    has_incoming_buses: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StopIncomingResponse {
+    stop_id: String,
+    stop_name: String,
+    stop_desc: String,
+    data: Vec<BusEta>,
+    meta: StopIncomingMeta,
+}
+
 #[derive(Debug)]
 struct RedisBusSnapshot {
     buses: Vec<BusPosition>,
@@ -206,6 +226,7 @@ const REDIS_INGEST_LAST_KEY: &str = "rapidbro:ingestor:last_ingest_at";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379/";
 const DEFAULT_BUS_TTL_SECONDS: i64 = 120;
 const DEFAULT_STALE_AFTER_SECONDS: i64 = 20;
+const PANTAI_HILLPARK_PHASE_5_STOP_ID: &str = "1008485";
 
 #[tokio::main]
 async fn main() {
@@ -268,6 +289,10 @@ async fn main() {
         .route("/ingestor/status", get(get_ingestor_status))
         .route("/get-route-t789", get(get_route_t789))
         .route("/get-t789-eta", get(get_t789_eta))
+        .route(
+            "/get-pantai-hillpark-phase-5-eta",
+            get(get_pantai_hillpark_phase_5_eta),
+        )
         .route("/route/{route_id}/eta/{stop_id}", get(get_route_eta))
         .route("/stops/{stop_id}/eta", get(get_stop_eta))
         .route("/stops/{stop_id}/routes", get(get_stop_routes))
@@ -733,6 +758,56 @@ async fn get_t789_eta(
     Ok(Json(eta_results))
 }
 
+// Calculate ETA for all incoming buses to Pantai Hillpark Phase 5 (stop 1008485).
+async fn get_pantai_hillpark_phase_5_eta(
+    State(state): State<AppState>,
+) -> Result<Json<StopIncomingResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = load_active_bus_snapshot(&state).await?;
+    let gtfs = load_gtfs_context()?;
+    let stop = gtfs
+        .stops_map
+        .get(PANTAI_HILLPARK_PHASE_5_STOP_ID)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Stop '{}' not found in GTFS data",
+                        PANTAI_HILLPARK_PHASE_5_STOP_ID
+                    ),
+                }),
+            )
+        })?;
+    let eta_results =
+        calculate_stop_eta_from_snapshot(&snapshot, &gtfs, PANTAI_HILLPARK_PHASE_5_STOP_ID);
+    let now_ms = now_unix_ms();
+    let is_stale = match snapshot.last_ingest_at_unix_ms {
+        Some(last_ingest_ms) => now_ms - last_ingest_ms > state.stale_after_ms,
+        None => true,
+    };
+
+    println!(
+        "Calling get_pantai_hillpark_phase_5_eta: {} incoming buses",
+        eta_results.len()
+    );
+
+    Ok(Json(StopIncomingResponse {
+        stop_id: stop.stop_id.clone(),
+        stop_name: stop.stop_name.clone(),
+        stop_desc: stop.stop_desc.clone(),
+        meta: StopIncomingMeta {
+            source: "redis",
+            generated_at_unix_ms: now_ms,
+            last_ingest_at_unix_ms: snapshot.last_ingest_at_unix_ms,
+            is_stale,
+            active_bus_count: snapshot.active_bus_count,
+            incoming_bus_count: eta_results.len(),
+            has_incoming_buses: !eta_results.is_empty(),
+        },
+        data: eta_results,
+    }))
+}
+
 // Calculate ETA for buses in route/{route_id} to reach stop/{stop_id}, based on Redis snapshot.
 async fn get_route_eta(
     Path((route_id, stop_id)): Path<(String, String)>,
@@ -755,49 +830,7 @@ async fn get_stop_eta(
 ) -> Result<Json<Vec<BusEta>>, (StatusCode, Json<ErrorResponse>)> {
     let snapshot = load_active_bus_snapshot(&state).await?;
     let gtfs = load_gtfs_context()?;
-
-    let mut all_eta_results: Vec<BusEta> = Vec::new();
-    let mut seen_bus_route: HashSet<String> = HashSet::new();
-
-    for route in &gtfs.routes {
-        let route_stops = match get_stops_by_route(
-            &route.route_id,
-            &gtfs.routes,
-            &gtfs.trips_by_route,
-            &gtfs.stop_times_by_trip,
-            &gtfs.stops_map,
-        ) {
-            Ok(stops) => stops,
-            Err(_) => continue,
-        };
-
-        if !route_stops.stops.iter().any(|stop| stop.stop_id == stop_id) {
-            continue;
-        }
-
-        let route_eta_results = match calculate_route_eta_from_stops(
-            &snapshot.buses,
-            &route.route_id,
-            &stop_id,
-            &route_stops,
-        ) {
-            Ok(results) => results,
-            Err(_) => continue,
-        };
-
-        for eta in route_eta_results {
-            let key = format!("{}::{}", eta.route_id, eta.bus_no);
-            if seen_bus_route.insert(key) {
-                all_eta_results.push(eta);
-            }
-        }
-    }
-
-    all_eta_results.sort_by(|a, b| {
-        a.eta_minutes
-            .partial_cmp(&b.eta_minutes)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let all_eta_results = calculate_stop_eta_from_snapshot(&snapshot, &gtfs, &stop_id);
 
     println!(
         "Calling get_stop_eta for stop_id={}: {} incoming buses",
@@ -827,6 +860,57 @@ async fn get_stop_routes(
     );
 
     Ok(Json(StopRoutesResponse { stop_id, routes }))
+}
+
+fn calculate_stop_eta_from_snapshot(
+    snapshot: &RedisBusSnapshot,
+    gtfs: &GtfsContext,
+    stop_id: &str,
+) -> Vec<BusEta> {
+    let mut all_eta_results: Vec<BusEta> = Vec::new();
+    let mut seen_bus_route: HashSet<String> = HashSet::new();
+
+    for route in &gtfs.routes {
+        let route_stops = match get_stops_by_route(
+            &route.route_id,
+            &gtfs.routes,
+            &gtfs.trips_by_route,
+            &gtfs.stop_times_by_trip,
+            &gtfs.stops_map,
+        ) {
+            Ok(stops) => stops,
+            Err(_) => continue,
+        };
+
+        if !route_stops.stops.iter().any(|stop| stop.stop_id == stop_id) {
+            continue;
+        }
+
+        let route_eta_results = match calculate_route_eta_from_stops(
+            &snapshot.buses,
+            &route.route_id,
+            stop_id,
+            &route_stops,
+        ) {
+            Ok(results) => results,
+            Err(_) => continue,
+        };
+
+        for eta in route_eta_results {
+            let key = format!("{}::{}", eta.route_id, eta.bus_no);
+            if seen_bus_route.insert(key) {
+                all_eta_results.push(eta);
+            }
+        }
+    }
+
+    all_eta_results.sort_by(|a, b| {
+        a.eta_minutes
+            .partial_cmp(&b.eta_minutes)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    all_eta_results
 }
 
 async fn calculate_route_eta(
