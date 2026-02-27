@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { AlertTriangle, LoaderCircle, LocateFixed, MapPin } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { BusRouteLine } from '@/components/BusRouteLine'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -9,8 +10,11 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { Dialog } from '@/components/ui/dialog'
 
 export const Route = createFileRoute('/')({ component: App })
+
+let hasAutoRequestedNearestStop = false
 
 type NearestStopResponse = {
   stop_id: string
@@ -46,6 +50,22 @@ type StopRoutesResponse = {
   routes: StopRouteSummary[]
 }
 
+type RouteStop = {
+  stop_id: string
+  stop_name: string
+  stop_desc: string
+  stop_lat: number
+  stop_lon: number
+  sequence: number
+}
+
+type RouteStopsResponse = {
+  route_id: string
+  route_short_name: string
+  route_long_name: string
+  stops: RouteStop[]
+}
+
 type UserCoords = {
   lat: number
   lon: number
@@ -62,14 +82,33 @@ function App() {
   )
   const [nearestStopEta, setNearestStopEta] = useState<BusEta[]>([])
   const [stopRoutes, setStopRoutes] = useState<StopRouteSummary[]>([])
+  const [routeStopsByRoute, setRouteStopsByRoute] = useState<
+    Record<string, RouteStopsResponse>
+  >({})
+  const [selectedBusKey, setSelectedBusKey] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [isLoadingEta, setIsLoadingEta] = useState(false)
   const [isLoadingRoutes, setIsLoadingRoutes] = useState(false)
+  const [isLoadingSelectedRoute, setIsLoadingSelectedRoute] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [etaErrorMessage, setEtaErrorMessage] = useState<string | null>(null)
   const [routeErrorMessage, setRouteErrorMessage] = useState<string | null>(
     null,
   )
+  const [selectedRouteErrorMessage, setSelectedRouteErrorMessage] = useState<
+    string | null
+  >(null)
+
+  const getBusKey = (eta: BusEta) =>
+    `${eta.route_id}-${eta.bus_no}-${eta.current_stop_id}`
+
+  const selectedBus =
+    selectedBusKey === null
+      ? null
+      : nearestStopEta.find((eta) => getBusKey(eta) === selectedBusKey) ?? null
+  const selectedRouteStops = selectedBus
+    ? routeStopsByRoute[selectedBus.route_id] ?? null
+    : null
 
   const fetchNearestStop = async (lat: number, lon: number) => {
     const params = new URLSearchParams({
@@ -95,6 +134,8 @@ function App() {
   const fetchEtaToStop = async (stopId: string) => {
     setEtaErrorMessage(null)
     setNearestStopEta([])
+    setSelectedBusKey(null)
+    setSelectedRouteErrorMessage(null)
     setIsLoadingEta(true)
 
     try {
@@ -111,6 +152,7 @@ function App() {
 
       const data = (await response.json()) as BusEta[]
       setNearestStopEta(data)
+      setSelectedBusKey(null)
     } catch (error) {
       setEtaErrorMessage(
         error instanceof Error
@@ -152,13 +194,67 @@ function App() {
     }
   }
 
+  const fetchRouteStops = async (routeId: string) => {
+    if (routeStopsByRoute[routeId]) {
+      return routeStopsByRoute[routeId]
+    }
+
+    setSelectedRouteErrorMessage(null)
+    setIsLoadingSelectedRoute(true)
+
+    try {
+      const response = await fetch(
+        `${apiBaseUrl}/route/${encodeURIComponent(routeId)}/stops`,
+      )
+      if (!response.ok) {
+        const fallbackMessage = 'Unable to fetch route stops'
+        const body = (await response.json().catch(() => null)) as {
+          error?: string
+        } | null
+        throw new Error(body?.error ?? fallbackMessage)
+      }
+
+      const data = (await response.json()) as RouteStopsResponse
+      setRouteStopsByRoute((current) => ({
+        ...current,
+        [routeId]: data,
+      }))
+      return data
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unable to fetch route stops'
+      setSelectedRouteErrorMessage(message)
+      throw error
+    } finally {
+      setIsLoadingSelectedRoute(false)
+    }
+  }
+
+  const handleSelectBus = async (eta: BusEta) => {
+    setSelectedBusKey(getBusKey(eta))
+    setSelectedRouteErrorMessage(null)
+
+    if (routeStopsByRoute[eta.route_id]) {
+      return
+    }
+
+    try {
+      await fetchRouteStops(eta.route_id)
+    } catch {
+      // Error state is handled above so the selected bus card can still render.
+    }
+  }
+
   const handleFindNearestStop = () => {
     setErrorMessage(null)
     setEtaErrorMessage(null)
     setRouteErrorMessage(null)
+    setSelectedRouteErrorMessage(null)
     setNearestStop(null)
     setNearestStopEta([])
     setStopRoutes([])
+    setRouteStopsByRoute({})
+    setSelectedBusKey(null)
     setIsLoading(true)
 
     if (!('geolocation' in navigator)) {
@@ -201,6 +297,15 @@ function App() {
     )
   }
 
+  useEffect(() => {
+    if (hasAutoRequestedNearestStop) {
+      return
+    }
+
+    hasAutoRequestedNearestStop = true
+    handleFindNearestStop()
+  }, [])
+
   return (
     <main className="mx-auto max-w-4xl p-4 md:p-6">
       <Card className="mb-6">
@@ -225,7 +330,7 @@ function App() {
             ) : (
               <>
                 <LocateFixed />
-                Find nearest stop
+                {coords ? 'Refresh nearest stop' : 'Find nearest stop'}
               </>
             )}
           </Button>
@@ -344,9 +449,15 @@ function App() {
                 {!isLoadingEta && nearestStopEta.length > 0 ? (
                   <div className="mt-2 space-y-2">
                     {nearestStopEta.map((eta) => (
-                      <div
-                        key={`${eta.route_id}-${eta.bus_no}-${eta.current_stop_id}`}
-                        className="rounded border bg-background p-2 text-sm"
+                      <button
+                        key={getBusKey(eta)}
+                        type="button"
+                        onClick={() => handleSelectBus(eta)}
+                        className={`block w-full rounded border bg-background p-2 text-left text-sm transition-colors ${
+                          selectedBusKey === getBusKey(eta)
+                            ? 'border-foreground bg-secondary'
+                            : 'hover:bg-muted/40'
+                        }`}
                       >
                         <p className="font-medium">Bus {eta.bus_no}</p>
                         <p className="text-muted-foreground">
@@ -357,23 +468,84 @@ function App() {
                         <p className="text-muted-foreground">
                           Current stop ID: {eta.current_stop_id}
                         </p>
-                      </div>
+                      </button>
                     ))}
                   </div>
                 ) : null}
               </div>
+
             </div>
           ) : (
             <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-              Tap{' '}
+              Automatically checking your location. You can also tap{' '}
               <span className="font-medium text-foreground">
-                Find nearest stop
+                {coords ? 'Refresh nearest stop' : 'Find nearest stop'}
               </span>{' '}
-              to begin.
+              any time.
             </div>
           )}
         </CardContent>
       </Card>
+
+      <Dialog
+        open={selectedBus !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setSelectedBusKey(null)
+          }
+        }}
+        title={
+          selectedBus
+            ? `Bus ${selectedBus.bus_no} · Route ${selectedBus.route_id}`
+            : 'Bus route detail'
+        }
+        description="The current bus position and your selected stop are highlighted on the route line."
+      >
+        {selectedBus ? (
+          <div className="space-y-4">
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              <p className="font-medium">
+                ETA {selectedBus.eta_minutes.toFixed(1)} min
+              </p>
+              <p className="text-muted-foreground">
+                {selectedBus.stops_away} stops away ·{' '}
+                {selectedBus.distance_km.toFixed(2)} km remaining
+              </p>
+              <p className="text-muted-foreground">
+                Current stop ID: {selectedBus.current_stop_id}
+              </p>
+            </div>
+
+            {isLoadingSelectedRoute ? (
+              <p className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+                Loading route line...
+              </p>
+            ) : null}
+
+            {selectedRouteErrorMessage ? (
+              <p className="text-sm text-destructive">
+                {selectedRouteErrorMessage}
+              </p>
+            ) : null}
+
+            {selectedRouteStops ? (
+              <BusRouteLine
+                routeShortName={
+                  selectedRouteStops.route_short_name ||
+                  selectedRouteStops.route_id
+                }
+                routeLongName={selectedRouteStops.route_long_name}
+                stops={selectedRouteStops.stops}
+                currentStopId={selectedBus.current_stop_id}
+                currentSequence={selectedBus.current_sequence}
+                targetStopId={nearestStop?.stop_id ?? null}
+                targetLabel="Your selected nearest stop"
+              />
+            ) : null}
+          </div>
+        ) : null}
+      </Dialog>
     </main>
   )
 }
