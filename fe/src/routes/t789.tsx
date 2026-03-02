@@ -57,9 +57,20 @@ type RouteStopsResponse = {
   }>
 }
 
+type RouteShapeResponse = {
+  route_id: string
+  shape_id: string
+  points: Array<{
+    lat: number
+    lon: number
+    sequence: number
+  }>
+}
+
 type T789RouteMapProps = {
   activeBuses: T789Bus[]
   routeStops: RouteStopsResponse | null
+  routeShape: RouteShapeResponse | null
   selectedBusNo: string | null
   targetStopId: string
   onSelectBus: (busNo: string) => void
@@ -75,6 +86,7 @@ function escapeLeafletHtml(value: string) {
 function T789RouteMap({
   activeBuses,
   routeStops,
+  routeShape,
   selectedBusNo,
   targetStopId,
   onSelectBus,
@@ -153,10 +165,22 @@ function T789RouteMap({
 
       const points: Array<[number, number]> = []
       const stops = routeStops?.stops ?? []
+      const shapePoints = routeShape?.points ?? []
       const targetStop =
         stops.find((stop) => stop.stop_id === targetStopId) ?? null
 
-      if (stops.length > 1) {
+      if (shapePoints.length > 1) {
+        const routePath = shapePoints.map(
+          (point) => [point.lat, point.lon] as [number, number],
+        )
+        routePath.forEach((point) => points.push(point))
+
+        L.polyline(routePath, {
+          color: '#0f766e',
+          weight: 5,
+          opacity: 0.9,
+        }).addTo(overlayLayer)
+      } else if (stops.length > 1) {
         const routePath = stops.map(
           (stop) => [stop.stop_lat, stop.stop_lon] as [number, number],
         )
@@ -259,7 +283,14 @@ function T789RouteMap({
     return () => {
       isDisposed = true
     }
-  }, [activeBuses, onSelectBus, routeStops, selectedBusNo, targetStopId])
+  }, [
+    activeBuses,
+    onSelectBus,
+    routeShape,
+    routeStops,
+    selectedBusNo,
+    targetStopId,
+  ])
 
   return (
     <div className="space-y-2">
@@ -286,6 +317,7 @@ function T789Page() {
   const [activeBuses, setActiveBuses] = useState<T789Bus[]>([])
   const [etas, setEtas] = useState<BusEta[]>([])
   const [routeStops, setRouteStops] = useState<RouteStopsResponse | null>(null)
+  const [routeShape, setRouteShape] = useState<RouteShapeResponse | null>(null)
   const [stopNameById, setStopNameById] = useState<Record<string, string>>({})
   const [selectedBusNo, setSelectedBusNo] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
@@ -337,11 +369,13 @@ function T789Page() {
     setIsLoading(true)
 
     try {
-      const [busesResponse, etaResponse, stopsResponse] = await Promise.all([
-        fetch(`${apiBaseUrl}/get-route-t789`),
-        fetch(`${apiBaseUrl}/get-t789-eta`),
-        fetch(`${apiBaseUrl}/route/T7890/stops`),
-      ])
+      const [busesResponse, etaResponse, stopsResponse, shapeResponse] =
+        await Promise.all([
+          fetch(`${apiBaseUrl}/get-route-t789`),
+          fetch(`${apiBaseUrl}/get-t789-eta`),
+          fetch(`${apiBaseUrl}/route/T7890/stops`),
+          fetch(`${apiBaseUrl}/route/T7890/shape`),
+        ])
 
       if (!busesResponse.ok) {
         const fallbackMessage = 'Unable to fetch active T789 buses'
@@ -385,6 +419,13 @@ function T789Page() {
           {},
         )
         setStopNameById(nameMap)
+      }
+
+      if (shapeResponse.ok) {
+        const shapeData = (await shapeResponse.json()) as RouteShapeResponse
+        setRouteShape(shapeData)
+      } else {
+        setRouteShape(null)
       }
 
       setLastUpdated(new Date())
@@ -442,6 +483,7 @@ function T789Page() {
             <p className="mb-2 text-sm font-medium">Live route map</p>
             <T789RouteMap
               activeBuses={activeBuses}
+              routeShape={routeShape}
               routeStops={routeStops}
               selectedBusNo={selectedBusNo}
               targetStopId={targetStopId}

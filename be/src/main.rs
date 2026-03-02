@@ -101,6 +101,28 @@ struct RouteStopsResponse {
     stops: Vec<StopWithDetails>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShapePoint {
+    shape_id: String,
+    shape_pt_lat: f64,
+    shape_pt_lon: f64,
+    shape_pt_sequence: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteShapePoint {
+    lat: f64,
+    lon: f64,
+    sequence: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteShapeResponse {
+    route_id: String,
+    shape_id: String,
+    points: Vec<RouteShapePoint>,
+}
+
 #[derive(Debug, Deserialize)]
 struct NearestStopQuery {
     lat: f64,
@@ -337,6 +359,7 @@ async fn main() {
         .route("/stops/{stop_id}/eta", get(get_stop_eta))
         .route("/stops/{stop_id}/routes", get(get_stop_routes))
         .route("/route/{route_id}/stops", get(get_route_stops))
+        .route("/route/{route_id}/shape", get(get_route_shape))
         .route("/stops/nearest", get(get_nearest_stop))
         .layer(cors)
         .with_state(app_state);
@@ -1462,6 +1485,23 @@ fn load_stops() -> Result<HashMap<String, Stop>, Box<dyn std::error::Error>> {
     Ok(stops_map)
 }
 
+fn load_shapes() -> Result<HashMap<String, Vec<ShapePoint>>, Box<dyn std::error::Error>> {
+    let path = StdPath::new(GTFS_DATA_PATH).join("shapes.txt");
+    let file = File::open(path)?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(file);
+    let mut shapes_by_id: HashMap<String, Vec<ShapePoint>> = HashMap::new();
+    for result in rdr.deserialize() {
+        let shape_point: ShapePoint = result?;
+        shapes_by_id
+            .entry(shape_point.shape_id.clone())
+            .or_default()
+            .push(shape_point);
+    }
+    Ok(shapes_by_id)
+}
+
 // Get stops by route_id
 fn get_stops_by_route(
     route_id: &str,
@@ -1522,6 +1562,45 @@ fn get_stops_by_route(
         route_short_name: route.route_short_name.clone(),
         route_long_name: route.route_long_name.clone(),
         stops,
+    })
+}
+
+fn get_shape_by_route(
+    route_id: &str,
+    trips_by_route: &HashMap<String, Vec<Trip>>,
+    shapes_by_id: &HashMap<String, Vec<ShapePoint>>,
+) -> Result<RouteShapeResponse, (StatusCode, String)> {
+    let trips = trips_by_route.get(route_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("No trips found for route '{}'", route_id),
+        )
+    })?;
+
+    let first_trip = &trips[0];
+    let shape_points = shapes_by_id.get(&first_trip.shape_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("No shape found for shape_id '{}'", first_trip.shape_id),
+        )
+    })?;
+
+    let mut sorted_points: Vec<&ShapePoint> = shape_points.iter().collect();
+    sorted_points.sort_by_key(|point| point.shape_pt_sequence);
+
+    let points = sorted_points
+        .into_iter()
+        .map(|point| RouteShapePoint {
+            lat: point.shape_pt_lat,
+            lon: point.shape_pt_lon,
+            sequence: point.shape_pt_sequence,
+        })
+        .collect();
+
+    Ok(RouteShapeResponse {
+        route_id: route_id.to_string(),
+        shape_id: first_trip.shape_id.clone(),
+        points,
     })
 }
 
@@ -1587,6 +1666,42 @@ async fn get_route_stops(
     ) {
         Ok(response) => {
             println!("Calling get_route_stops for route_id={}", route_id);
+            Ok(Json(response))
+        }
+        Err((status, message)) => Err((status, Json(ErrorResponse { error: message }))),
+    }
+}
+
+async fn get_route_shape(
+    Path(route_id): Path<String>,
+) -> Result<Json<RouteShapeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let trips_by_route = match load_trips() {
+        Ok(t) => t,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load trips: {}", e),
+                }),
+            ));
+        }
+    };
+
+    let shapes_by_id = match load_shapes() {
+        Ok(s) => s,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load shapes: {}", e),
+                }),
+            ));
+        }
+    };
+
+    match get_shape_by_route(&route_id, &trips_by_route, &shapes_by_id) {
+        Ok(response) => {
+            println!("Calling get_route_shape for route_id={}", route_id);
             Ok(Json(response))
         }
         Err((status, message)) => Err((status, Json(ErrorResponse { error: message }))),
