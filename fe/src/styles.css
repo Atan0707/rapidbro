@@ -1,5 +1,6 @@
 @import 'tailwindcss';
 @import 'tw-animate-css';
+@import 'leaflet/dist/leaflet.css';
 
 :root {
   --background: oklch(1 0 0);
@@ -58,4 +59,52 @@
   body {
     @apply m-0 bg-background text-foreground antialiased;
   }
+}
+
+.t789-map {
+  height: 22rem;
+  width: 100%;
+  background: radial-gradient(
+    circle at top,
+    oklch(0.99 0.01 100),
+    oklch(0.95 0.015 220)
+  );
+}
+
+.t789-map .leaflet-container {
+  height: 100%;
+  width: 100%;
+  border-radius: inherit;
+  font: inherit;
+}
+
+.t789-map .leaflet-control-attribution {
+  font-size: 0.625rem;
+}
+
+.t789-bus-icon {
+  background: transparent;
+  border: 0;
+}
+
+.t789-bus-marker {
+  display: inline-flex;
+  min-width: 2.25rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 2px solid oklch(0.24 0.06 200);
+  background: oklch(0.99 0.01 100 / 0.96);
+  padding: 0.3rem 0.55rem;
+  color: oklch(0.22 0.03 220);
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 10px 24px oklch(0.2 0.02 220 / 0.16);
+}
+
+.t789-bus-marker.is-selected {
+  border-color: oklch(0.61 0.18 30);
+  background: oklch(0.72 0.16 40 / 0.96);
+  color: oklch(0.99 0.01 100);
 }

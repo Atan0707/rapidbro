@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { AlertTriangle, LoaderCircle, RefreshCw } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { LayerGroup, Map as LeafletMap } from 'leaflet'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BusRouteLine } from '@/components/BusRouteLine'
 import { Button } from '@/components/ui/button'
 import {
@@ -56,6 +57,225 @@ type RouteStopsResponse = {
   }>
 }
 
+type T789RouteMapProps = {
+  activeBuses: T789Bus[]
+  routeStops: RouteStopsResponse | null
+  selectedBusNo: string | null
+  targetStopId: string
+  onSelectBus: (busNo: string) => void
+}
+
+function escapeLeafletHtml(value: string) {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
+function T789RouteMap({
+  activeBuses,
+  routeStops,
+  selectedBusNo,
+  targetStopId,
+  onSelectBus,
+}: T789RouteMapProps) {
+  const mapContainerRef = useRef<HTMLDivElement | null>(null)
+  const mapRef = useRef<LeafletMap | null>(null)
+  const overlayLayerRef = useRef<LayerGroup | null>(null)
+  const hasAutoFitRef = useRef(false)
+  const lastSelectedBusNoRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    let isDisposed = false
+
+    const setupMap = async () => {
+      if (
+        isDisposed ||
+        typeof window === 'undefined' ||
+        !mapContainerRef.current ||
+        mapRef.current
+      ) {
+        return
+      }
+
+      const L = await import('leaflet')
+
+      if (isDisposed || !mapContainerRef.current || mapRef.current) {
+        return
+      }
+
+      const map = L.map(mapContainerRef.current, {
+        zoomControl: true,
+        attributionControl: true,
+      })
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(map)
+
+      mapRef.current = map
+      overlayLayerRef.current = L.layerGroup().addTo(map)
+      requestAnimationFrame(() => {
+        map.invalidateSize()
+      })
+    }
+
+    void setupMap()
+
+    return () => {
+      isDisposed = true
+      overlayLayerRef.current?.clearLayers()
+      mapRef.current?.remove()
+      overlayLayerRef.current = null
+      mapRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    let isDisposed = false
+
+    const syncMap = async () => {
+      if (!mapRef.current) {
+        return
+      }
+
+      const L = await import('leaflet')
+
+      if (isDisposed || !mapRef.current) {
+        return
+      }
+
+      const map = mapRef.current
+      const overlayLayer = overlayLayerRef.current ?? L.layerGroup().addTo(map)
+
+      overlayLayerRef.current = overlayLayer
+      overlayLayer.clearLayers()
+
+      const points: Array<[number, number]> = []
+      const stops = routeStops?.stops ?? []
+      const targetStop =
+        stops.find((stop) => stop.stop_id === targetStopId) ?? null
+
+      if (stops.length > 1) {
+        const routePath = stops.map(
+          (stop) => [stop.stop_lat, stop.stop_lon] as [number, number],
+        )
+        routePath.forEach((point) => points.push(point))
+
+        L.polyline(routePath, {
+          color: '#0f766e',
+          weight: 4,
+          opacity: 0.8,
+        }).addTo(overlayLayer)
+      }
+
+      stops.forEach((stop) => {
+        const isTargetStop = stop.stop_id === targetStopId
+
+        points.push([stop.stop_lat, stop.stop_lon])
+
+        L.circleMarker([stop.stop_lat, stop.stop_lon], {
+          radius: isTargetStop ? 7 : 4,
+          color: isTargetStop ? '#b45309' : '#475569',
+          weight: 2,
+          fillColor: isTargetStop ? '#f59e0b' : '#f8fafc',
+          fillOpacity: 0.95,
+        })
+          .bindTooltip(
+            isTargetStop
+              ? `${stop.stop_name} (KL Gateway target)`
+              : stop.stop_name,
+          )
+          .addTo(overlayLayer)
+      })
+
+      activeBuses.forEach((bus) => {
+        const isSelected = bus.bus_no === selectedBusNo
+        const currentStopLabel =
+          bus.resolved_stop_name ??
+          bus.resolved_stop_id ??
+          bus.busstop_id ??
+          'Unknown'
+
+        points.push([bus.latitude, bus.longitude])
+
+        const marker = L.marker([bus.latitude, bus.longitude], {
+          icon: L.divIcon({
+            className: 't789-bus-icon',
+            html: `<div class="t789-bus-marker${isSelected ? ' is-selected' : ''}">${escapeLeafletHtml(bus.bus_no)}</div>`,
+            iconSize: [44, 32],
+            iconAnchor: [22, 16],
+          }),
+          title: `Bus ${bus.bus_no}`,
+        })
+
+        marker.on('click', () => {
+          onSelectBus(bus.bus_no)
+        })
+
+        marker
+          .bindPopup(
+            `<strong>Bus ${escapeLeafletHtml(bus.bus_no)}</strong><br/>Speed: ${bus.speed.toFixed(1)} km/h<br/>Current stop: ${escapeLeafletHtml(currentStopLabel)}`,
+          )
+          .addTo(overlayLayer)
+      })
+
+      if (targetStop && activeBuses.length === 0) {
+        points.push([targetStop.stop_lat, targetStop.stop_lon])
+      }
+
+      const selectedBus =
+        selectedBusNo === null
+          ? null
+          : (activeBuses.find((bus) => bus.bus_no === selectedBusNo) ?? null)
+
+      if (selectedBus) {
+        if (lastSelectedBusNoRef.current !== selectedBus.bus_no) {
+          map.flyTo([selectedBus.latitude, selectedBus.longitude], 15, {
+            animate: true,
+            duration: 0.4,
+          })
+          lastSelectedBusNoRef.current = selectedBus.bus_no
+        }
+      } else {
+        lastSelectedBusNoRef.current = null
+
+        if (!hasAutoFitRef.current && points.length > 0) {
+          map.fitBounds(points, {
+            padding: [24, 24],
+            animate: false,
+          })
+          hasAutoFitRef.current = true
+        }
+      }
+
+      requestAnimationFrame(() => {
+        map.invalidateSize()
+      })
+    }
+
+    void syncMap()
+
+    return () => {
+      isDisposed = true
+    }
+  }, [activeBuses, onSelectBus, routeStops, selectedBusNo, targetStopId])
+
+  return (
+    <div className="space-y-2">
+      <div
+        ref={mapContainerRef}
+        className="t789-map rounded-xl border"
+        aria-label="Live T789 route map"
+      />
+      <p className="text-xs text-muted-foreground">
+        The route line, KL Gateway target stop, and active buses are shown on
+        the map.
+      </p>
+    </div>
+  )
+}
+
 function T789Page() {
   const targetStopId = '1000838'
   const apiBaseUrl = useMemo(
@@ -76,11 +296,11 @@ function T789Page() {
   const selectedActiveBus =
     selectedBusNo === null
       ? null
-      : activeBuses.find((bus) => bus.bus_no === selectedBusNo) ?? null
+      : (activeBuses.find((bus) => bus.bus_no === selectedBusNo) ?? null)
   const selectedEta =
     selectedBusNo === null
       ? null
-      : etas.find((eta) => eta.bus_no === selectedBusNo) ?? null
+      : (etas.find((eta) => eta.bus_no === selectedBusNo) ?? null)
   const targetStopName = stopNameById[targetStopId] || 'KL Gateway'
   const selectedCurrentStopId =
     selectedActiveBus?.resolved_stop_id ??
@@ -95,6 +315,9 @@ function T789Page() {
     null
   const interactiveCardClassName =
     'block w-full cursor-pointer rounded border p-2 text-left transition-colors outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]'
+  const handleSelectBus = useCallback((busNo: string) => {
+    setSelectedBusNo(busNo)
+  }, [])
 
   const normalizeT789Buses = (payload: unknown): T789Bus[] => {
     if (Array.isArray(payload)) {
@@ -132,10 +355,7 @@ function T789Page() {
       const normalizedBuses = normalizeT789Buses(payload)
       setActiveBuses(normalizedBuses)
       setSelectedBusNo((current) => {
-        if (
-          current &&
-          normalizedBuses.some((bus) => bus.bus_no === current)
-        ) {
+        if (current && normalizedBuses.some((bus) => bus.bus_no === current)) {
           return current
         }
 
@@ -218,6 +438,17 @@ function T789Page() {
             </p>
           </div>
 
+          <div className="rounded-md border p-3">
+            <p className="mb-2 text-sm font-medium">Live route map</p>
+            <T789RouteMap
+              activeBuses={activeBuses}
+              routeStops={routeStops}
+              selectedBusNo={selectedBusNo}
+              targetStopId={targetStopId}
+              onSelectBus={handleSelectBus}
+            />
+          </div>
+
           {errorMessage ? (
             <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3">
               <p className="inline-flex items-center gap-2 text-sm font-medium text-destructive">
@@ -252,13 +483,13 @@ function T789Page() {
               </p>
             ) : null}
 
-          {activeBuses.length > 0 ? (
+            {activeBuses.length > 0 ? (
               <div className="space-y-2">
                 {activeBuses.map((bus) => (
                   <button
                     key={`${bus.route}-${bus.bus_no}`}
                     type="button"
-                    onClick={() => setSelectedBusNo(bus.bus_no)}
+                    onClick={() => handleSelectBus(bus.bus_no)}
                     className={`${interactiveCardClassName} ${
                       selectedBusNo === bus.bus_no
                         ? 'border-foreground bg-secondary'
@@ -305,7 +536,7 @@ function T789Page() {
                   <button
                     key={`${eta.route_id || 'T7890'}-${eta.bus_no}-${eta.current_stop_id}`}
                     type="button"
-                    onClick={() => setSelectedBusNo(eta.bus_no)}
+                    onClick={() => handleSelectBus(eta.bus_no)}
                     className={`${interactiveCardClassName} ${
                       selectedBusNo === eta.bus_no
                         ? 'border-foreground bg-secondary'
@@ -333,7 +564,6 @@ function T789Page() {
               </div>
             ) : null}
           </div>
-
         </CardContent>
       </Card>
 
