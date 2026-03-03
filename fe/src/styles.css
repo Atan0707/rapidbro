@@ -151,3 +151,20 @@
   box-shadow: 0 0 0 3px oklch(0.73 0.18 85 / 0.45);
   transform: scale(1.06);
 }
+
+.bus-focus-map {
+  height: 20rem;
+  width: 100%;
+  background: radial-gradient(
+    circle at top,
+    oklch(0.99 0.01 100),
+    oklch(0.95 0.015 220)
+  );
+}
+
+.bus-focus-map .leaflet-container {
+  height: 100%;
+  width: 100%;
+  border-radius: inherit;
+  font: inherit;
+}

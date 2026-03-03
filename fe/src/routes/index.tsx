@@ -103,6 +103,13 @@ type NearestStopMapProps = {
   getBusKey: (eta: BusEta) => string
 }
 
+type SelectedBusMapProps = {
+  nearestStop: NearestStopResponse | null
+  selectedBus: BusEta
+  selectedRouteStops: RouteStopsResponse | null
+  routeColorById: Record<string, RouteColorToken>
+}
+
 function NearestStopMap({
   nearestStop,
   nearestStopEta,
@@ -279,6 +286,151 @@ function NearestStopMap({
       <p className="text-xs text-muted-foreground">
         Marker colors indicate different routes. Tap a bus marker to open route
         details.
+      </p>
+    </div>
+  )
+}
+
+function SelectedBusMap({
+  nearestStop,
+  selectedBus,
+  selectedRouteStops,
+  routeColorById,
+}: SelectedBusMapProps) {
+  const mapContainerRef = useRef<HTMLDivElement | null>(null)
+  const mapRef = useRef<LeafletMap | null>(null)
+  const overlayLayerRef = useRef<LayerGroup | null>(null)
+
+  useEffect(() => {
+    let isDisposed = false
+
+    const setupMap = async () => {
+      if (
+        isDisposed ||
+        typeof window === 'undefined' ||
+        !mapContainerRef.current ||
+        mapRef.current
+      ) {
+        return
+      }
+
+      const L = await import('leaflet')
+
+      if (isDisposed || !mapContainerRef.current || mapRef.current) {
+        return
+      }
+
+      const map = L.map(mapContainerRef.current, {
+        zoomControl: true,
+        attributionControl: true,
+      })
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(map)
+
+      mapRef.current = map
+      overlayLayerRef.current = L.layerGroup().addTo(map)
+      requestAnimationFrame(() => map.invalidateSize())
+    }
+
+    void setupMap()
+
+    return () => {
+      isDisposed = true
+      overlayLayerRef.current?.clearLayers()
+      mapRef.current?.remove()
+      overlayLayerRef.current = null
+      mapRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    let isDisposed = false
+
+    const syncMap = async () => {
+      if (!mapRef.current) {
+        return
+      }
+
+      const L = await import('leaflet')
+
+      if (isDisposed || !mapRef.current) {
+        return
+      }
+
+      const map = mapRef.current
+      const overlayLayer = overlayLayerRef.current ?? L.layerGroup().addTo(map)
+      overlayLayerRef.current = overlayLayer
+      overlayLayer.clearLayers()
+
+      const points: Array<[number, number]> = []
+      const routeColor = routeColorById[selectedBus.route_id]
+
+      if (selectedRouteStops && selectedRouteStops.stops.length > 1) {
+        const routePath = selectedRouteStops.stops.map(
+          (stop) => [stop.stop_lat, stop.stop_lon] as [number, number],
+        )
+
+        routePath.forEach((point) => points.push(point))
+
+        L.polyline(routePath, {
+          color: routeColor?.border ?? '#0f766e',
+          weight: 5,
+          opacity: 0.95,
+        }).addTo(overlayLayer)
+      }
+
+      points.push([selectedBus.current_lat, selectedBus.current_lon])
+      L.circleMarker([selectedBus.current_lat, selectedBus.current_lon], {
+        radius: 8,
+        color: routeColor?.border ?? '#1f2937',
+        weight: 2,
+        fillColor: routeColor?.background ?? '#f8fafc',
+        fillOpacity: 0.98,
+      })
+        .bindTooltip(`Bus ${selectedBus.bus_no} (live)`)
+        .addTo(overlayLayer)
+
+      if (nearestStop) {
+        points.push([nearestStop.stop_lat, nearestStop.stop_lon])
+        L.circleMarker([nearestStop.stop_lat, nearestStop.stop_lon], {
+          radius: 7,
+          color: '#b45309',
+          weight: 2,
+          fillColor: '#f59e0b',
+          fillOpacity: 0.95,
+        })
+          .bindTooltip(`${nearestStop.stop_name} (Nearest stop)`)
+          .addTo(overlayLayer)
+      }
+
+      if (points.length > 0) {
+        map.fitBounds(points, {
+          padding: [24, 24],
+          animate: false,
+        })
+      }
+
+      requestAnimationFrame(() => map.invalidateSize())
+    }
+
+    void syncMap()
+
+    return () => {
+      isDisposed = true
+    }
+  }, [nearestStop, routeColorById, selectedBus, selectedRouteStops])
+
+  return (
+    <div className="space-y-2">
+      <div
+        ref={mapContainerRef}
+        className="bus-focus-map rounded-xl border"
+        aria-label="Selected bus map"
+      />
+      <p className="text-xs text-muted-foreground">
+        Focused map for this bus, with nearest stop and route line.
       </p>
     </div>
   )
@@ -833,6 +985,13 @@ function App() {
                 {selectedRouteErrorMessage}
               </p>
             ) : null}
+
+            <SelectedBusMap
+              nearestStop={nearestStop}
+              selectedBus={selectedBus}
+              selectedRouteStops={selectedRouteStops}
+              routeColorById={routeColorById}
+            />
 
             {selectedRouteStops ? (
               <BusRouteLine
