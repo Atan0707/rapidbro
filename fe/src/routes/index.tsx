@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { AlertTriangle, LoaderCircle, LocateFixed, MapPin } from 'lucide-react'
+import type { LayerGroup, Map as LeafletMap } from 'leaflet'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { BusRouteLine } from '@/components/BusRouteLine'
 import { Button } from '@/components/ui/button'
@@ -71,6 +72,218 @@ type UserCoords = {
   lon: number
 }
 
+type RouteColorToken = {
+  border: string
+  background: string
+  text: string
+}
+
+const routeColorFromId = (routeId: string): RouteColorToken => {
+  let hash = 0
+  for (let i = 0; i < routeId.length; i += 1) {
+    hash = routeId.charCodeAt(i) + ((hash << 5) - hash)
+  }
+
+  const hue = Math.abs(hash) % 360
+  return {
+    border: `hsl(${hue} 80% 42%)`,
+    background: `hsl(${hue} 92% 95%)`,
+    text: `hsl(${hue} 72% 26%)`,
+  }
+}
+
+type NearestStopMapProps = {
+  nearestStop: NearestStopResponse
+  nearestStopEta: BusEta[]
+  selectedBusKey: string | null
+  selectedRouteId: string | null
+  allRouteStops: RouteStopsResponse[]
+  routeColorById: Record<string, RouteColorToken>
+  onSelectBus: (eta: BusEta) => void
+  getBusKey: (eta: BusEta) => string
+}
+
+function NearestStopMap({
+  nearestStop,
+  nearestStopEta,
+  selectedBusKey,
+  selectedRouteId,
+  allRouteStops,
+  routeColorById,
+  onSelectBus,
+  getBusKey,
+}: NearestStopMapProps) {
+  const mapContainerRef = useRef<HTMLDivElement | null>(null)
+  const mapRef = useRef<LeafletMap | null>(null)
+  const overlayLayerRef = useRef<LayerGroup | null>(null)
+
+  useEffect(() => {
+    let isDisposed = false
+
+    const setupMap = async () => {
+      if (
+        isDisposed ||
+        typeof window === 'undefined' ||
+        !mapContainerRef.current ||
+        mapRef.current
+      ) {
+        return
+      }
+
+      const L = await import('leaflet')
+
+      if (isDisposed || !mapContainerRef.current || mapRef.current) {
+        return
+      }
+
+      const map = L.map(mapContainerRef.current, {
+        zoomControl: true,
+        attributionControl: true,
+      })
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(map)
+
+      mapRef.current = map
+      overlayLayerRef.current = L.layerGroup().addTo(map)
+      requestAnimationFrame(() => map.invalidateSize())
+    }
+
+    void setupMap()
+
+    return () => {
+      isDisposed = true
+      overlayLayerRef.current?.clearLayers()
+      mapRef.current?.remove()
+      overlayLayerRef.current = null
+      mapRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    let isDisposed = false
+
+    const syncMap = async () => {
+      if (!mapRef.current) {
+        return
+      }
+
+      const L = await import('leaflet')
+
+      if (isDisposed || !mapRef.current) {
+        return
+      }
+
+      const map = mapRef.current
+      const overlayLayer = overlayLayerRef.current ?? L.layerGroup().addTo(map)
+      overlayLayerRef.current = overlayLayer
+      overlayLayer.clearLayers()
+
+      const points: Array<[number, number]> = []
+
+      points.push([nearestStop.stop_lat, nearestStop.stop_lon])
+
+      L.circleMarker([nearestStop.stop_lat, nearestStop.stop_lon], {
+        radius: 8,
+        color: '#b45309',
+        weight: 2,
+        fillColor: '#f59e0b',
+        fillOpacity: 0.95,
+      })
+        .bindTooltip(`${nearestStop.stop_name} (Nearest stop)`)
+        .addTo(overlayLayer)
+
+      allRouteStops.forEach((routeStops) => {
+        if (routeStops.stops.length < 2) {
+          return
+        }
+
+        const routePath = routeStops.stops.map(
+          (stop) => [stop.stop_lat, stop.stop_lon] as [number, number],
+        )
+        routePath.forEach((point) => points.push(point))
+
+        const routeColor = routeColorById[routeStops.route_id]
+        const isSelectedRoute = selectedRouteId === routeStops.route_id
+
+        L.polyline(routePath, {
+          color: routeColor?.border ?? '#0f766e',
+          weight: isSelectedRoute ? 6 : 4,
+          opacity: isSelectedRoute ? 0.95 : 0.65,
+        })
+          .bindTooltip(
+            `Route ${routeStops.route_short_name || routeStops.route_id}`,
+          )
+          .addTo(overlayLayer)
+      })
+
+      nearestStopEta.forEach((eta) => {
+        const isSelected = selectedBusKey === getBusKey(eta)
+        const routeColor = routeColorById[eta.route_id]
+
+        points.push([eta.current_lat, eta.current_lon])
+
+        const marker = L.marker([eta.current_lat, eta.current_lon], {
+          icon: L.divIcon({
+            className: 'nearest-stop-bus-icon',
+            html: `<div class="nearest-stop-bus-marker${isSelected ? ' is-selected' : ''}" style="border-color:${routeColor?.border ?? '#1f2937'};background:${routeColor?.background ?? '#f8fafc'};color:${routeColor?.text ?? '#111827'}">${eta.bus_no}</div>`,
+            iconSize: [44, 32],
+            iconAnchor: [22, 16],
+          }),
+          title: `Bus ${eta.bus_no}`,
+        })
+
+        marker.on('click', () => onSelectBus(eta))
+
+        marker
+          .bindPopup(
+            `<strong>Bus ${eta.bus_no}</strong><br/>Route: ${eta.route_id}<br/>ETA: ${eta.eta_minutes.toFixed(1)} min<br/>Current stop: ${eta.current_stop_name}`,
+          )
+          .addTo(overlayLayer)
+      })
+
+      if (points.length > 0) {
+        map.fitBounds(points, {
+          padding: [24, 24],
+          animate: false,
+        })
+      }
+
+      requestAnimationFrame(() => map.invalidateSize())
+    }
+
+    void syncMap()
+
+    return () => {
+      isDisposed = true
+    }
+  }, [
+    getBusKey,
+    nearestStop,
+    nearestStopEta,
+    onSelectBus,
+    routeColorById,
+    selectedBusKey,
+    selectedRouteId,
+    allRouteStops,
+  ])
+
+  return (
+    <div className="space-y-2">
+      <div
+        ref={mapContainerRef}
+        className="nearest-stop-map rounded-xl border"
+        aria-label="Nearest stop map"
+      />
+      <p className="text-xs text-muted-foreground">
+        Marker colors indicate different routes. Tap a bus marker to open route
+        details.
+      </p>
+    </div>
+  )
+}
+
 function App() {
   const apiBaseUrl = useMemo(
     () => import.meta.env.VITE_BE_URL ?? 'http://localhost:3030',
@@ -111,6 +324,21 @@ function App() {
   const selectedRouteStops = selectedBus
     ? routeStopsByRoute[selectedBus.route_id] ?? null
     : null
+  const selectedRouteId = selectedBus?.route_id ?? null
+  const allRouteStops = useMemo(() => {
+    return stopRoutes
+      .map((route) => routeStopsByRoute[route.route_id])
+      .filter((routeStops): routeStops is RouteStopsResponse =>
+        Boolean(routeStops),
+      )
+  }, [routeStopsByRoute, stopRoutes])
+  const routeColorById = useMemo(() => {
+    return stopRoutes.reduce<Record<string, RouteColorToken>>((acc, route) => {
+      acc[route.route_id] = routeColorFromId(route.route_id)
+      return acc
+    }, {})
+  }, [stopRoutes])
+  const hasMultipleRoutes = stopRoutes.length > 1
 
   const fetchNearestStop = async (lat: number, lon: number) => {
     const params = new URLSearchParams({
@@ -317,6 +545,16 @@ function App() {
     return () => window.clearInterval(id)
   }, [])
 
+  useEffect(() => {
+    if (stopRoutes.length === 0) {
+      return
+    }
+
+    void Promise.all(
+      stopRoutes.map((route) => fetchRouteStops(route.route_id).catch(() => null)),
+    )
+  }, [stopRoutes])
+
   return (
     <main className="mx-auto max-w-4xl p-4 md:p-6">
       <Card className="mb-6">
@@ -395,6 +633,20 @@ function App() {
                 {nearestStop.distance_km.toFixed(3)} km)
               </p>
 
+              <div className="mt-4 rounded-md border p-3">
+                <p className="mb-2 text-sm font-medium">Nearest stop map</p>
+                <NearestStopMap
+                  nearestStop={nearestStop}
+                  nearestStopEta={nearestStopEta}
+                  selectedBusKey={selectedBusKey}
+                  selectedRouteId={selectedRouteId}
+                  allRouteStops={allRouteStops}
+                  routeColorById={routeColorById}
+                  onSelectBus={handleSelectBus}
+                  getBusKey={getBusKey}
+                />
+              </div>
+
               <div className="mt-4 rounded-md border bg-muted/30 p-3">
                 <p className="text-sm font-medium">
                   Routes serving this stop
@@ -426,8 +678,16 @@ function App() {
                       <div
                         key={route.route_id}
                         className="rounded-md border bg-background px-3 py-2 text-sm"
+                        style={{
+                          borderColor: routeColorById[route.route_id]?.border,
+                          backgroundColor:
+                            routeColorById[route.route_id]?.background,
+                        }}
                       >
-                        <p className="font-medium">
+                        <p
+                          className="font-medium"
+                          style={{ color: routeColorById[route.route_id]?.text }}
+                        >
                           {route.route_short_name || route.route_id}
                         </p>
                         <p className="text-muted-foreground">
@@ -477,7 +737,22 @@ function App() {
                             : 'hover:bg-muted/40'
                         }`}
                       >
-                        <p className="font-medium">Bus {eta.bus_no}</p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="font-medium">Bus {eta.bus_no}</p>
+                          {hasMultipleRoutes ? (
+                            <span
+                              className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium"
+                              style={{
+                                borderColor: routeColorById[eta.route_id]?.border,
+                                backgroundColor:
+                                  routeColorById[eta.route_id]?.background,
+                                color: routeColorById[eta.route_id]?.text,
+                              }}
+                            >
+                              Route {eta.route_id}
+                            </span>
+                          ) : null}
+                        </div>
                         <p className="text-muted-foreground">
                           Route {eta.route_id} · ETA{' '}
                           {eta.eta_minutes.toFixed(1)} min · {eta.stops_away}{' '}
